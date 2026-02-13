@@ -31,7 +31,7 @@ class TestBlockManager(unittest.TestCase):
     def test_initialization(self):
         """Test BlockManager initialization."""
         # Check tensor shape
-        expected_shape = (self.num_blocks, self.num_layers, 2, self.num_heads, self.head_dim, self.block_size)
+        expected_shape = (self.num_layers, self.num_blocks, 2, self.block_size, self.num_heads, self.head_dim)
         self.assertEqual(self.block_manager.kv_cache_pool.shape, expected_shape)
         
         # Check all blocks are free initially
@@ -108,7 +108,7 @@ class TestBlockManager(unittest.TestCase):
         # Get the tensor
         block_tensor = self.block_manager.get_block_tensor(block_idx)
         
-        expected_shape = (self.num_layers, 2, self.num_heads, self.head_dim, self.block_size)
+        expected_shape = (self.num_layers, 2, self.block_size, self.num_heads, self.head_dim)
         self.assertEqual(block_tensor.shape, expected_shape)
     
     def test_get_block_tensor_invalid_index(self):
@@ -127,7 +127,7 @@ class TestBlockManager(unittest.TestCase):
         # Get KV cache for these blocks
         kv_cache = self.block_manager.get_kv_cache_for_blocks(block_indices)
         
-        expected_shape = (2, self.num_layers, 2, self.num_heads, self.head_dim, self.block_size)
+        expected_shape = (self.num_layers, 2, 2, self.block_size, self.num_heads, self.head_dim)
         self.assertEqual(kv_cache.shape, expected_shape)
     
     def test_reset(self):

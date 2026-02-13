@@ -182,7 +182,7 @@ class ModelExecutor:
         
         return output
     
-    def get_kv_cache_from_blocks(self, block_indices: List[int]) -> tuple:
+    def get_kv_cache_from_blocks(self, block_indices: List[int], layer_idx: int = 0) -> tuple:
         """
         Extract KV cache tensors for given block indices.
         
@@ -196,20 +196,24 @@ class ModelExecutor:
         kv_cache = self.block_manager.get_kv_cache_for_blocks(block_indices)
         
         # Split into key and value caches
-        # Shape: [num_blocks, num_layers, 2, num_heads, head_dim, block_size]
-        key_cache = kv_cache[:, :, 0, :, :, :]  # [num_blocks, num_layers, num_heads, head_dim, block_size]
-        value_cache = kv_cache[:, :, 1, :, :, :]  # [num_blocks, num_layers, num_heads, head_dim, block_size]
+        # Shape: [num_layers, num_blocks, 2, block_size, num_heads, head_dim]
+        # Extract for the current layer: [num_blocks, 2, block_size, num_heads, head_dim]
+        kv_cache_layer = kv_cache[layer_idx, :, :, :, :, :]  # Get KV cache for specific layer
+        key_cache = kv_cache_layer[:, 0, :, :, :]  # [num_blocks, block_size, num_heads, head_dim]
+        value_cache = kv_cache_layer[:, 1, :, :, :]  # [num_blocks, block_size, num_heads, head_dim]
         
-        # Reshape for FlashInfer: flatten block and sequence dimensions
+        # Reshape for FlashInfer NHD layout: flatten block and sequence dimensions
         num_blocks = key_cache.shape[0]
-        num_layers = key_cache.shape[1]
+        block_size = key_cache.shape[1]
         
-        key_cache = key_cache.permute(1, 0, 2, 3, 4).reshape(
-            num_layers, num_blocks * self.page_size, self.num_heads, self.head_dim
-        )
-        value_cache = value_cache.permute(1, 0, 2, 3, 4).reshape(
-            num_layers, num_blocks * self.page_size, self.num_heads, self.head_dim
-        )
+        # Reshape to FlashInfer format: [1, num_blocks * block_size, num_heads, head_dim]
+        # Note: We only reshape the current layer's data
+        key_cache = key_cache.reshape(1, num_blocks * block_size, self.num_heads, self.head_dim)
+        value_cache = value_cache.reshape(1, num_blocks * block_size, self.num_heads, self.head_dim)
+        
+        # Expand to match expected number of layers (for compatibility)
+        key_cache = key_cache.expand(self.num_layers, -1, -1, -1)
+        value_cache = value_cache.expand(self.num_layers, -1, -1, -1)
         
         return key_cache, value_cache
     
@@ -240,7 +244,7 @@ class ModelExecutor:
         all_blocks = list(set(block for table in block_tables for block in table))
         
         # Get KV cache tensors
-        key_cache, value_cache = self.get_kv_cache_from_blocks(all_blocks)
+        key_cache, value_cache = self.get_kv_cache_from_blocks(all_blocks, layer_idx)
         
         # Create a simple query tensor for demonstration
         # In real implementation, this would come from the model's hidden states
