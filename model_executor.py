@@ -133,8 +133,7 @@ class ModelExecutor:
     def compute_attention_with_flashinfer(
         self,
         query: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
+        kv_cache: torch.Tensor,
         block_tables: List[List[int]],
         seq_lengths: List[int],
         is_prefill: bool = True,
@@ -144,9 +143,9 @@ class ModelExecutor:
         Compute attention using FlashInfer operators.
         
         Args:
-            query: Query tensor [batch_size, num_heads, head_dim]
-            key_cache: Key cache tensor from BlockManager
-            value_cache: Value cache tensor from BlockManager
+            query: Query tensor [batch_size, num_heads, head_dim] or [total_tokens, num_heads, head_dim] for prefill
+            kv_cache: Combined KV cache tensor [num_blocks, 2, block_size, num_heads, head_dim] - physical pool
+                      where [.., 0, ...] is key and [.., 1, ...] is value
             block_tables: Block tables for each sequence
             seq_lengths: Sequence lengths
             is_prefill: Whether this is prefill or decode
@@ -155,13 +154,17 @@ class ModelExecutor:
         Returns:
             Attention output tensor
         """
-        batch_size = query.shape[0]
-        
-        # Prepare FlashInfer inputs
+        # Prepare FlashInfer inputs - ensures all indices are int32
         flashinfer_inputs = self.prepare_flashinfer_inputs(
             block_tables, seq_lengths, is_prefill
         )
         
+        # Split the combined KV cache into key and value components
+        # FlashInfer expects separate key and value tensors
+        key_cache = kv_cache[:, 0, :, :, :]  # [num_blocks, block_size, num_heads, head_dim]
+        value_cache = kv_cache[:, 1, :, :, :]  # [num_blocks, block_size, num_heads, head_dim]
+        
+        # FlashInfer will handle the paged access internally using block tables and indices
         if is_prefill:
             # Prefill phase: compute attention for all tokens
             output = self.prefill_wrapper.forward(
@@ -182,40 +185,7 @@ class ModelExecutor:
         
         return output
     
-    def get_kv_cache_from_blocks(self, block_indices: List[int], layer_idx: int = 0) -> tuple:
-        """
-        Extract KV cache tensors for given block indices.
-        
-        Args:
-            block_indices: List of physical block indices
-            
-        Returns:
-            Tuple of (key_cache, value_cache) tensors
-        """
-        # Get KV cache for specified blocks
-        kv_cache = self.block_manager.get_kv_cache_for_blocks(block_indices)
-        
-        # Split into key and value caches
-        # Shape: [num_layers, num_blocks, 2, block_size, num_heads, head_dim]
-        # Extract for the current layer: [num_blocks, 2, block_size, num_heads, head_dim]
-        kv_cache_layer = kv_cache[layer_idx, :, :, :, :, :]  # Get KV cache for specific layer
-        key_cache = kv_cache_layer[:, 0, :, :, :]  # [num_blocks, block_size, num_heads, head_dim]
-        value_cache = kv_cache_layer[:, 1, :, :, :]  # [num_blocks, block_size, num_heads, head_dim]
-        
-        # Reshape for FlashInfer NHD layout: flatten block and sequence dimensions
-        num_blocks = key_cache.shape[0]
-        block_size = key_cache.shape[1]
-        
-        # Reshape to FlashInfer format: [1, num_blocks * block_size, num_heads, head_dim]
-        # Note: We only reshape the current layer's data
-        key_cache = key_cache.reshape(1, num_blocks * block_size, self.num_heads, self.head_dim)
-        value_cache = value_cache.reshape(1, num_blocks * block_size, self.num_heads, self.head_dim)
-        
-        # Expand to match expected number of layers (for compatibility)
-        key_cache = key_cache.expand(self.num_layers, -1, -1, -1)
-        value_cache = value_cache.expand(self.num_layers, -1, -1, -1)
-        
-        return key_cache, value_cache
+
     
     def execute_model(
         self,
@@ -243,8 +213,9 @@ class ModelExecutor:
         # Get all unique block indices
         all_blocks = list(set(block for table in block_tables for block in table))
         
-        # Get KV cache tensors
-        key_cache, value_cache = self.get_kv_cache_from_blocks(all_blocks, layer_idx)
+        # Get the raw KV cache pool for the current layer (zero-copy view)
+        # Shape: [num_blocks, 2, block_size, num_heads, head_dim] - this is the NHD format FlashInfer expects
+        layer_kv_cache = self.block_manager.kv_cache_pool[layer_idx, :, :, :, :, :]  # [num_blocks, 2, block_size, num_heads, head_dim]
         
         # Create a simple query tensor for demonstration
         # In real implementation, this would come from the model's hidden states
@@ -261,19 +232,37 @@ class ModelExecutor:
                 dtype=self.dtype, device=self.device
             )
         
-        # Use only the specified layer's KV cache
-        layer_key_cache = key_cache[layer_idx]
-        layer_value_cache = value_cache[layer_idx]
-        
-        # Compute attention with FlashInfer
+        # Compute attention with FlashInfer using the raw physical pool
+        # FlashInfer will handle the paged access internally using the block tables
         attention_output = self.compute_attention_with_flashinfer(
             query,
-            layer_key_cache,
-            layer_value_cache,
+            layer_kv_cache,  # Pass the entire layer's KV cache pool directly: [num_blocks, 2, block_size, num_heads, head_dim]
             block_tables,
             seq_lengths,
             is_prefill=is_prefill
         )
+        
+        # Generate new K and V values (in a real implementation, these would come from the model)
+        new_k = torch.randn(batch_size, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device)
+        new_v = torch.randn(batch_size, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device)
+        
+        # Convert new_k and new_v to the expected format for append_slot
+        # We need to convert from [batch_size, num_heads, head_dim] to [num_tokens, num_heads, head_dim]
+        if is_prefill:
+            new_k_expanded = new_k.view(-1, self.num_heads, self.head_dim)  # [batch_size * seq_len, num_heads, head_dim]
+            new_v_expanded = new_v.view(-1, self.num_heads, self.head_dim)  # [batch_size * seq_len, num_heads, head_dim]
+        else:
+            # For decode phase, we're adding one token per sequence
+            new_k_expanded = new_k  # [batch_size, num_heads, head_dim]
+            new_v_expanded = new_v  # [batch_size, num_heads, head_dim]
+        
+        # Update the KV cache by appending new values to the appropriate blocks
+        # This is the crucial step that ensures new tokens are stored in the KV cache for future decoding
+        try:
+            self.block_manager.append_slot(all_blocks, new_k_expanded, new_v_expanded)
+        except Exception as e:
+            # In production, you'd want more sophisticated error handling
+            print(f"Warning: Could not append new KV values: {e}")
         
         return attention_output
     
