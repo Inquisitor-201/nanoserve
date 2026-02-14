@@ -8,11 +8,11 @@ import torch
 import logging
 import os
 from pathlib import Path
-from safetensors.torch import load_file
 
 from .backends import AttentionMetadata, FlashInferBackend
 from .models import Qwen3Model
 from .block_manager import BlockManager
+from .model_loader import ModelLoader
 
 
 logger = logging.getLogger(__name__)
@@ -93,7 +93,7 @@ class ModelExecutor:
             
             # Load model weights if path provided
             if model_path:
-                self._load_model_weights(model_path, dtype, device)
+                ModelLoader.load_weights(self.model, model_path, dtype, device)
                 
         else:
             raise ValueError(f"Unsupported model: {model_name}")
@@ -204,83 +204,6 @@ class ModelExecutor:
             "model": str(self.model),
             "block_manager": str(self.block_manager)
         }
-    
-    def _load_model_weights(self, model_path: str, dtype: torch.dtype, device: str) -> None:
-        """
-        Load model weights from safetensors file.
-        
-        Args:
-            model_path: Path to the model directory
-            dtype: Target data type for weights
-            device: Target device
-        """
-        logger.info(f"Loading model weights from {model_path}")
-        
-        # Look for safetensors file
-        model_file = os.path.join(model_path, "model.safetensors")
-        if not os.path.exists(model_file):
-            raise FileNotFoundError(f"Model file not found: {model_file}")
-        
-        # Load weights
-        state_dict = load_file(model_file)
-        logger.info(f"Loaded {len(state_dict)} parameters from {model_file}")
-        
-        # Convert dtype and move to device
-        for name, param in state_dict.items():
-            if param.dtype != dtype:
-                param = param.to(dtype)
-            if device != "cpu":
-                param = param.to(device)
-            state_dict[name] = param
-        
-        # Load weights into model (simplified - in practice need proper mapping)
-        try:
-            self.model.load_state_dict(state_dict, strict=False)
-            logger.info("Successfully loaded model weights")
-        except Exception as e:
-            logger.warning(f"Partial weight loading failed: {e}")
-            # Try to load compatible weights
-            model_dict = self.model.state_dict()
-            compatible_dict = {}
-            for name, param in state_dict.items():
-                # Map common weight names
-                mapped_name = self._map_weight_name(name)
-                if mapped_name in model_dict and param.shape == model_dict[mapped_name].shape:
-                    compatible_dict[mapped_name] = param
-                elif name in model_dict and param.shape == model_dict[name].shape:
-                    compatible_dict[name] = param
-            
-            if compatible_dict:
-                self.model.load_state_dict(compatible_dict, strict=False)
-                logger.info(f"Loaded {len(compatible_dict)} compatible parameters")
-    
-    def _map_weight_name(self, hf_name: str) -> str:
-        """
-        Map HuggingFace weight names to our model naming.
-        
-        Args:
-            hf_name: HuggingFace weight name
-            
-        Returns:
-            Mapped weight name
-        """
-        # Simple mapping - in practice needs more sophisticated mapping
-        name_mapping = {
-            "model.embed_tokens.weight": "embed_tokens.weight",
-            "model.norm.weight": "norm.weight",
-            # Add more mappings as needed
-        }
-        
-        # Handle layer-specific mappings
-        if "model.layers." in hf_name:
-            # Convert layers.X to layers[X]
-            parts = hf_name.split('.')
-            if len(parts) >= 3 and parts[1] == "layers":
-                layer_idx = parts[2]
-                remaining = '.'.join(parts[3:])
-                return f"layers.{layer_idx}.{remaining}"
-        
-        return name_mapping.get(hf_name, hf_name)
     
     def __repr__(self) -> str:
         return f"ModelExecutor(model_name={self.model_name}, device={self.device})"

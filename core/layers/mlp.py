@@ -53,6 +53,15 @@ class MLP(nn.Module):
         
         # Up projection (second linear layer)
         self.up_proj = nn.Linear(
+            hidden_size,
+            self.intermediate_size,
+            bias=bias,
+            device=device,
+            dtype=dtype
+        )
+        
+        # Down projection (third linear layer)
+        self.down_proj = nn.Linear(
             self.intermediate_size,
             hidden_size,
             bias=bias,
@@ -84,10 +93,12 @@ class MLP(nn.Module):
             Output hidden states
         """
         # First linear layer + activation
-        intermediate = self.activation(self.gate_proj(hidden_states))
+        gate = self.gate_proj(hidden_states)
+        up = self.up_proj(hidden_states)
+        intermediate = self.activation(gate * up)
         
-        # Second linear layer
-        output = self.up_proj(intermediate)
+        # Third linear layer
+        output = self.down_proj(intermediate)
         
         # Dropout
         if self.dropout is not None:

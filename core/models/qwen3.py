@@ -97,20 +97,14 @@ class Qwen3DecoderLayer(nn.Module):
         # Self-attention with residual connection
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        
-        # Attention computation - backend handles all the complex attention logic
-        attn_output = self.self_attn(
-            hidden_states=hidden_states,
-            metadata=metadata,
-            layer_idx=self.layer_idx
-        )
-        hidden_states = residual + attn_output
+        hidden_states = self.self_attn(hidden_states, metadata, layer_idx=self.layer_idx)
+        hidden_states = residual + hidden_states
         
         # MLP with residual connection
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        mlp_output = self.mlp(hidden_states)
-        hidden_states = residual + mlp_output
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
         
         return hidden_states
 
@@ -198,6 +192,9 @@ class Qwen3Model(nn.Module):
         
         # Final layer norm
         self.norm = nn.RMSNorm(hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
+        
+        # Language model head
+        self.lm_head = nn.Linear(hidden_size, vocab_size, device=device, dtype=dtype)
     
     def forward(
         self,
@@ -244,9 +241,9 @@ class Qwen3Model(nn.Module):
         Generate tokens using the model.
         
         Args:
-            input_ids: Input token IDs (flattened, no padding)
+            input_ids: Initial input token IDs (flattened, no padding)
             block_tables: Block tables for each sequence
-            seq_lengths: Sequence lengths
+            seq_lengths: Initial sequence lengths
             max_new_tokens: Maximum number of new tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling threshold
@@ -255,30 +252,10 @@ class Qwen3Model(nn.Module):
         Returns:
             Generated token IDs
         """
-        # Create attention metadata with qo_indptr for unpadding
-        metadata = AttentionMetadata.from_block_tables(
-            block_tables=block_tables,
-            seq_lengths=seq_lengths,
-            is_prefill=True,
-            device=input_ids.device,
-            qo_indptr=qo_indptr  # Pass qo_indptr for FlashInfer
-        )
+        # This is a simplified implementation for demonstration
+        # In practice, you would implement proper token-by-token generation
+        # with KV cache management
         
-        # Forward pass
-        hidden_states = self.forward(input_ids, metadata)
-        
-        # Simple generation logic (in practice, you'd use more sophisticated sampling)
-        # This is just a placeholder
-        logits = torch.randn(input_ids.shape[0], self.vocab_size, device=input_ids.device)
-        
-        # Sample next tokens
-        if temperature > 0:
-            probs = torch.softmax(logits / temperature, dim=-1)
-            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        else:
-            next_tokens = torch.argmax(logits, dim=-1)
-        
-        return next_tokens
-    
-    def __repr__(self) -> str:
-        return f"Qwen3Model(vocab_size={self.vocab_size}, hidden_size={self.hidden_size}, num_layers={self.num_layers})"
+        # For now, we'll just return the input IDs as a placeholder
+        # This should be replaced with actual generation logic
+        return input_ids
