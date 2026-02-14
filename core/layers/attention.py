@@ -93,15 +93,15 @@ class Attention(nn.Module):
         Returns:
             Output hidden states
         """
-        batch_size, seq_len, _ = hidden_states.shape
+        # For unpadding, hidden_states is already flattened: [total_tokens, hidden_size]
+        total_tokens, hidden_size = hidden_states.shape
         
         # QKV projection
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.chunk(3, dim=-1)
         
         # Reshape for attention computation
-        # [batch_size, seq_len, num_heads * head_dim] -> [total_tokens, num_heads, head_dim]
-        total_tokens = batch_size * seq_len
+        # [total_tokens, num_heads * head_dim] -> [total_tokens, num_heads, head_dim]
         q = q.view(total_tokens, self.num_heads, self.head_dim)
         k = k.view(total_tokens, self.num_heads, self.head_dim)
         v = v.view(total_tokens, self.num_heads, self.head_dim)
@@ -146,8 +146,8 @@ class Attention(nn.Module):
         # Reshape to [total_tokens, hidden_size]
         attn_output = attn_output.view(total_tokens, self.num_heads * self.head_dim)
         
-        # Reshape to [batch_size, seq_len, hidden_size]
-        attn_output = attn_output.view(batch_size, seq_len, self.hidden_size)
+        # For unpadding, we keep the flattened format [total_tokens, hidden_size]
+        # No need to reshape back to [batch_size, seq_len, hidden_size]
         
         # Output projection
         output = self.o_proj(attn_output)

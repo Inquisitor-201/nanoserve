@@ -171,8 +171,22 @@ class LLMService:
             input_ids = encoded["input_ids"].to(self.device)
             attention_mask = encoded["attention_mask"].to(self.device)
             
-            batch_size, seq_len = input_ids.shape
+            batch_size, max_seq_len = input_ids.shape
             seq_lengths = attention_mask.sum(dim=1).tolist()
+            
+            # UNPADDING: Remove padding tokens to create compact 1D tensor
+            # This is critical for FlashInfer Paged KV Cache to avoid wasting memory
+            flattened_input_ids = input_ids[attention_mask.bool()].contiguous()
+            
+            # Build qo_indptr for FlashInfer to identify sequence boundaries
+            qo_indptr = [0]
+            for seq_len in seq_lengths:
+                qo_indptr.append(qo_indptr[-1] + seq_len)
+            qo_indptr_tensor = torch.tensor(qo_indptr, dtype=torch.int32, device=self.device)
+            
+            logger.info(f"Unpadding: batch_size={batch_size}, max_seq_len={max_seq_len}, total_tokens={flattened_input_ids.shape[0]}")
+            logger.info(f"qo_indptr: {qo_indptr}")
+            
         else:
             # Fallback to placeholder tokenization
             logger.warning("No tokenizer available, using placeholder tokenization")
@@ -180,14 +194,20 @@ class LLMService:
             seq_lengths = [len(prompt) for prompt in prompts]
             max_seq_len = max(seq_lengths)
             
-            # Create random input IDs as placeholder
+            # Create random input IDs as placeholder (no padding needed)
             vocab_size = self.model_executor.model.vocab_size if self.model_executor else 32000
-            input_ids = torch.randint(
+            flattened_input_ids = torch.randint(
                 0, vocab_size,
-                (batch_size, max_seq_len),
+                (sum(seq_lengths),),  # Total tokens, no padding
                 device=self.device,
                 dtype=torch.long
             )
+            
+            # Build qo_indptr for placeholder
+            qo_indptr = [0]
+            for seq_len in seq_lengths:
+                qo_indptr.append(qo_indptr[-1] + seq_len)
+            qo_indptr_tensor = torch.tensor(qo_indptr, dtype=torch.int32, device=self.device)
         
         # Create block tables for KV cache allocation
         block_tables = []
@@ -198,14 +218,15 @@ class LLMService:
                 raise RuntimeError(f"Failed to allocate {num_blocks} blocks for sequence length {seq_len}")
             block_tables.append(blocks)
         
-        # Execute generation
+        # Execute generation with unpadding
         generated_ids = self.model_executor.generate(
-            input_ids=input_ids,
+            input_ids=flattened_input_ids,  # Use flattened input (no padding)
             block_tables=block_tables,
             seq_lengths=seq_lengths,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
-            top_p=top_p
+            top_p=top_p,
+            qo_indptr=qo_indptr_tensor  # Pass qo_indptr for FlashInfer
         )
         
         # Convert back to text using tokenizer

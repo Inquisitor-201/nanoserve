@@ -85,7 +85,7 @@ class Qwen3DecoderLayer(nn.Module):
         Forward pass of decoder layer.
         
         Args:
-            hidden_states: Input hidden states
+            hidden_states: Input hidden states (flattened 2D tensor for unpadding)
             metadata: Attention metadata
             
         Returns:
@@ -200,16 +200,17 @@ class Qwen3Model(nn.Module):
         Forward pass of the model.
         
         Args:
-            input_ids: Input token IDs
+            input_ids: Input token IDs (flattened 1D tensor for unpadding)
             metadata: Attention metadata
             
         Returns:
-            Hidden states
+            Hidden states (flattened 2D tensor)
         """
         # Plan attention computation once for the entire batch
         self.attention_backend.plan(metadata)
         
-        # Embedding
+        # Embedding - input_ids is already flattened (total_tokens,)
+        # embed_tokens expects 1D tensor and returns 2D tensor (total_tokens, hidden_size)
         hidden_states = self.embed_tokens(input_ids)
         
         # Pass through decoder layers
@@ -228,28 +229,31 @@ class Qwen3Model(nn.Module):
         seq_lengths: List[int],
         max_new_tokens: int = 100,
         temperature: float = 1.0,
-        top_p: float = 0.9
+        top_p: float = 0.9,
+        qo_indptr: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Generate tokens using the model.
         
         Args:
-            input_ids: Input token IDs
+            input_ids: Input token IDs (flattened, no padding)
             block_tables: Block tables for each sequence
             seq_lengths: Sequence lengths
             max_new_tokens: Maximum number of new tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling threshold
+            qo_indptr: Query/Output indices pointer for FlashInfer (required for unpadding)
             
         Returns:
             Generated token IDs
         """
-        # Create attention metadata
+        # Create attention metadata with qo_indptr for unpadding
         metadata = AttentionMetadata.from_block_tables(
             block_tables=block_tables,
             seq_lengths=seq_lengths,
             is_prefill=True,
-            device=input_ids.device
+            device=input_ids.device,
+            qo_indptr=qo_indptr  # Pass qo_indptr for FlashInfer
         )
         
         # Forward pass

@@ -164,18 +164,20 @@ class ModelExecutor:
         seq_lengths: List[int],
         max_new_tokens: int = 100,
         temperature: float = 1.0,
-        top_p: float = 0.9
+        top_p: float = 0.9,
+        qo_indptr: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Generate tokens using the model.
         
         Args:
-            input_ids: Initial input token IDs
+            input_ids: Initial input token IDs (flattened, no padding)
             block_tables: Block tables for each sequence
             seq_lengths: Initial sequence lengths
             max_new_tokens: Maximum number of new tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling threshold
+            qo_indptr: Query/Output indices pointer for FlashInfer (required for unpadding)
             
         Returns:
             Generated token IDs
@@ -186,7 +188,8 @@ class ModelExecutor:
             seq_lengths=seq_lengths,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
-            top_p=top_p
+            top_p=top_p,
+            qo_indptr=qo_indptr
         )
     
     def get_model_info(self) -> Dict[str, Any]:
