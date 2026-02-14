@@ -27,21 +27,23 @@ class Qwen3DecoderLayer(nn.Module):
         intermediate_size: int,
         attention_backend,
         layer_idx: int,
+        num_key_value_heads: Optional[int] = None,
         rms_norm_eps: float = 1e-6,
         dropout: float = 0.0,
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None
     ):
         """
-        Initialize Qwen3 decoder layer.
+        Initialize Qwen3 decoder layer with GQA support.
         
         Args:
             hidden_size: Hidden size of the model
-            num_heads: Number of attention heads
+            num_heads: Number of attention heads (Query heads)
             head_dim: Dimension of each attention head
             intermediate_size: Intermediate size for MLP
             attention_backend: Attention backend instance
             layer_idx: Layer index
+            num_key_value_heads: Number of key/value heads (for GQA). If None, defaults to num_heads
             rms_norm_eps: RMS norm epsilon
             dropout: Dropout probability
             device: Computing device
@@ -52,11 +54,12 @@ class Qwen3DecoderLayer(nn.Module):
         self.hidden_size = hidden_size
         self.layer_idx = layer_idx
         
-        # Self-attention with pluggable backend
+        # Self-attention with pluggable backend and GQA support
         self.self_attn = Attention(
             hidden_size=hidden_size,
             num_heads=num_heads,
             head_dim=head_dim,
+            num_key_value_heads=num_key_value_heads,
             backend=attention_backend,
             dropout=dropout,
             device=device,
@@ -129,6 +132,7 @@ class Qwen3Model(nn.Module):
         head_dim: int,
         intermediate_size: int,
         num_layers: int,
+        num_key_value_heads: Optional[int] = None,
         rms_norm_eps: float = 1e-6,
         dropout: float = 0.0,
         attention_backend_type: str = "flashinfer",
@@ -136,15 +140,16 @@ class Qwen3Model(nn.Module):
         dtype: Optional[torch.dtype] = None
     ):
         """
-        Initialize Qwen3 model.
+        Initialize Qwen3 model with GQA support.
         
         Args:
             vocab_size: Vocabulary size
             hidden_size: Hidden size of the model
-            num_heads: Number of attention heads
+            num_heads: Number of attention heads (Query heads)
             head_dim: Dimension of each attention head
             intermediate_size: Intermediate size for MLP
             num_layers: Number of decoder layers
+            num_key_value_heads: Number of key/value heads (for GQA). If None, defaults to num_heads
             rms_norm_eps: RMS norm epsilon
             dropout: Dropout probability
             attention_backend_type: Type of attention backend
@@ -156,11 +161,13 @@ class Qwen3Model(nn.Module):
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        self.num_key_value_heads = num_key_value_heads or num_heads
         
         # Initialize attention backend - only FlashInfer supported
         if attention_backend_type == "flashinfer":
             self.attention_backend = FlashInferBackend(
                 num_heads=num_heads,
+                num_key_value_heads=self.num_key_value_heads,
                 head_dim=head_dim,
                 device=device,
                 dtype=dtype
@@ -180,6 +187,7 @@ class Qwen3Model(nn.Module):
                 intermediate_size=intermediate_size,
                 attention_backend=self.attention_backend,
                 layer_idx=i,
+                num_key_value_heads=self.num_key_value_heads,
                 rms_norm_eps=rms_norm_eps,
                 dropout=dropout,
                 device=device,

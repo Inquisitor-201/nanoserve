@@ -31,6 +31,7 @@ class ModelExecutor:
         vocab_size: int = 32000,
         hidden_size: int = 4096,
         num_heads: int = 32,
+        num_key_value_heads: Optional[int] = None,
         head_dim: int = 128,
         intermediate_size: int = 11008,
         num_layers: int = 32,
@@ -42,13 +43,14 @@ class ModelExecutor:
         model_path: Optional[str] = None
     ):
         """
-        Initialize model executor.
+        Initialize model executor with GQA support.
         
         Args:
             model_name: Name of the model architecture
             vocab_size: Vocabulary size
             hidden_size: Hidden size of the model
-            num_heads: Number of attention heads
+            num_heads: Number of attention heads (Query heads)
+            num_key_value_heads: Number of key/value heads (for GQA). If None, defaults to num_heads
             head_dim: Dimension of each attention head
             intermediate_size: Intermediate size for MLP
             num_layers: Number of decoder layers
@@ -80,6 +82,7 @@ class ModelExecutor:
                 vocab_size=vocab_size,
                 hidden_size=hidden_size,
                 num_heads=num_heads,
+                num_key_value_heads=num_key_value_heads,
                 head_dim=head_dim,
                 intermediate_size=intermediate_size,
                 num_layers=num_layers,

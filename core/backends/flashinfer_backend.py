@@ -35,17 +35,19 @@ class FlashInferBackend:
         self,
         num_heads: int,
         head_dim: int,
+        num_key_value_heads: Optional[int] = None,
         page_size: int = 16,
         dtype: torch.dtype = torch.float16,
         device: str = "cuda",
         workspace_size_mb: int = 128
     ):
         """
-        Initialize FlashInfer backend.
+        Initialize FlashInfer backend with GQA support.
         
         Args:
-            num_heads: Number of attention heads
+            num_heads: Number of attention heads (Query heads)
             head_dim: Dimension of each attention head
+            num_key_value_heads: Number of key/value heads (for GQA). If None, defaults to num_heads
             page_size: Size of each page in paged KV cache
             dtype: Data type for computations
             device: Computing device
@@ -58,9 +60,15 @@ class FlashInferBackend:
         
         self.num_heads = num_heads
         self.head_dim = head_dim
+        self.num_key_value_heads = num_key_value_heads or num_heads
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
+        
+        # Validate GQA configuration
+        if num_heads % self.num_key_value_heads != 0:
+            raise ValueError(f"num_heads ({num_heads}) must be divisible by num_key_value_heads ({self.num_key_value_heads})")
+        self.num_key_value_groups = num_heads // self.num_key_value_heads
         
         # Initialize workspace buffers
         workspace_size = workspace_size_mb * 1024 * 1024
@@ -83,7 +91,8 @@ class FlashInferBackend:
         self._current_metadata: Optional[AttentionMetadata] = None
         self._is_planned = False
         
-        logger.info(f"Initialized FlashInferBackend: num_heads={num_heads}, head_dim={head_dim}, page_size={page_size}")
+        logger.info(f"Initialized FlashInferBackend: num_heads={num_heads}, num_key_value_heads={self.num_key_value_heads}, "
+                   f"head_dim={head_dim}, page_size={page_size}, num_key_value_groups={self.num_key_value_groups}")
     
     def plan(self, metadata: AttentionMetadata) -> None:
         """
@@ -114,10 +123,10 @@ class FlashInferBackend:
             metadata.paged_kv_indptr,
             metadata.paged_kv_indices,
             metadata.paged_kv_last_page_len,
-            self.num_heads,      # num_qo_heads
-            self.num_heads,      # num_kv_heads
-            self.head_dim,       # head_dim_qk
-            self.page_size,      # page_size
+            self.num_heads,              # num_qo_heads
+            self.num_key_value_heads,    # num_kv_heads (GQA support)
+            self.head_dim,               # head_dim_qk
+            self.page_size,              # page_size
             causal=metadata.causal,
             q_data_type=self.dtype,
             kv_data_type=self.dtype,
@@ -129,10 +138,10 @@ class FlashInferBackend:
             metadata.paged_kv_indptr,
             metadata.paged_kv_indices,
             metadata.paged_kv_last_page_len,
-            self.num_heads,      # num_qo_heads
-            self.num_heads,      # num_kv_heads
-            self.head_dim,       # head_dim
-            self.page_size,      # page_size
+            self.num_heads,              # num_qo_heads
+            self.num_key_value_heads,    # num_kv_heads (GQA support)
+            self.head_dim,               # head_dim
+            self.page_size,              # page_size
             data_type=self.dtype,
         )
     
@@ -145,17 +154,17 @@ class FlashInferBackend:
         metadata: Optional[AttentionMetadata] = None
     ) -> torch.Tensor:
         """
-        Run attention computation.
+        Run attention computation with GQA support.
         
         Args:
-            query: Query tensor
-            key_cache: Key cache tensor
-            value_cache: Value cache tensor
-            layer_idx: Layer index (for future multi-layer support)
+            query: Query tensor [total_tokens, num_heads, head_dim]
+            key_cache: Key cache tensor [total_tokens, num_key_value_heads, head_dim]
+            value_cache: Value cache tensor [total_tokens, num_key_value_heads, head_dim]
+            layer_idx: Layer index for multi-layer support
             metadata: Optional metadata override
             
         Returns:
-            Attention output tensor
+            Attention output tensor [total_tokens, num_heads, head_dim]
         """
         if metadata is not None and metadata != self._current_metadata:
             # Re-plan if metadata changed
@@ -163,6 +172,9 @@ class FlashInferBackend:
         elif not self._is_planned:
             raise RuntimeError("Must call plan() before run()")
         
+        # FlashInfer will handle:
+        # 1. Append K, V to physical KV cache pool
+        # 2. Execute FlashInfer attention computation with GQA support
         if self._current_metadata.is_prefill:
             return self.prefill_wrapper.run(query, key_cache, value_cache)
         else:

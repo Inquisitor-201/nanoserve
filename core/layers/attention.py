@@ -29,19 +29,21 @@ class Attention(nn.Module):
         num_heads: int,
         head_dim: int,
         backend,
+        num_key_value_heads: Optional[int] = None,
         bias: bool = True,
         dropout: float = 0.0,
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None
     ):
         """
-        Initialize attention layer.
+        Initialize attention layer with GQA support.
         
         Args:
             hidden_size: Hidden size of the model
-            num_heads: Number of attention heads
+            num_heads: Number of attention heads (Query heads)
             head_dim: Dimension of each attention head
             backend: Attention backend instance (e.g., FlashInferBackend)
+            num_key_value_heads: Number of key/value heads (for GQA). If None, defaults to num_heads (MHA)
             bias: Whether to use bias in linear projections
             dropout: Dropout probability
             device: Computing device
@@ -52,12 +54,28 @@ class Attention(nn.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = head_dim
+        self.num_key_value_heads = num_key_value_heads or num_heads
         self.backend = backend
         
-        # QKV projection
-        self.qkv_proj = nn.Linear(
+        # Validate GQA configuration
+        if num_heads % self.num_key_value_heads != 0:
+            raise ValueError(f"num_heads ({num_heads}) must be divisible by num_key_value_heads ({self.num_key_value_heads})")
+        self.num_key_value_groups = num_heads // self.num_key_value_heads
+        
+        # GQA: Separate projections for Q and KV
+        # Q projection: [hidden_size, num_heads * head_dim]
+        self.q_proj = nn.Linear(
             hidden_size,
-            3 * num_heads * head_dim,
+            num_heads * head_dim,
+            bias=bias,
+            device=device,
+            dtype=dtype
+        )
+        
+        # KV projection: [hidden_size, num_key_value_heads * head_dim * 2]
+        self.kv_proj = nn.Linear(
+            hidden_size,
+            self.num_key_value_heads * head_dim * 2,
             bias=bias,
             device=device,
             dtype=dtype
@@ -74,7 +92,9 @@ class Attention(nn.Module):
         
         self.dropout = nn.Dropout(dropout) if dropout > 0 else None
         
-        logger.info(f"Initialized Attention: hidden_size={hidden_size}, num_heads={num_heads}, head_dim={head_dim}")
+        logger.info(f"Initialized GQA Attention: hidden_size={hidden_size}, num_heads={num_heads}, "
+                   f"num_key_value_heads={self.num_key_value_heads}, head_dim={head_dim}, "
+                   f"num_key_value_groups={self.num_key_value_groups}")
     
     def forward(
         self,
@@ -83,71 +103,54 @@ class Attention(nn.Module):
         layer_idx: int = 0
     ) -> torch.Tensor:
         """
-        Forward pass of attention layer.
+        Forward pass of GQA attention layer with FlashInfer physical pool support.
         
         Args:
-            hidden_states: Input hidden states
+            hidden_states: Input hidden states (flattened: [total_tokens, hidden_size])
             metadata: Attention metadata for backend
             layer_idx: Layer index for multi-layer models
             
         Returns:
-            Output hidden states
+            Output hidden states (flattened: [total_tokens, hidden_size])
         """
         # For unpadding, hidden_states is already flattened: [total_tokens, hidden_size]
         total_tokens, hidden_size = hidden_states.shape
         
-        # QKV projection
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.chunk(3, dim=-1)
+        # GQA: Separate Q and KV projections
+        # Q projection: [total_tokens, num_heads * head_dim]
+        q = self.q_proj(hidden_states)
+        
+        # KV projection: [total_tokens, num_key_value_heads * head_dim * 2]
+        kv = self.kv_proj(hidden_states)
+        k, v = kv.chunk(2, dim=-1)
         
         # Reshape for attention computation
-        # [total_tokens, num_heads * head_dim] -> [total_tokens, num_heads, head_dim]
+        # Q: [total_tokens, num_heads, head_dim]
         q = q.view(total_tokens, self.num_heads, self.head_dim)
-        k = k.view(total_tokens, self.num_heads, self.head_dim)
-        v = v.view(total_tokens, self.num_heads, self.head_dim)
+        
+        # K, V: [total_tokens, num_key_value_heads, head_dim]
+        k = k.view(total_tokens, self.num_key_value_heads, self.head_dim)
+        v = v.view(total_tokens, self.num_key_value_heads, self.head_dim)
+        
+        # Apply RoPE (placeholder - to be implemented with actual position info)
+        # TODO: Implement actual RoPE based on metadata.position_ids or similar
+        # For now, we skip RoPE as it's not available in current metadata
         
         # Backend attention computation
-        # For FlashInfer, we need to format KV cache properly
-        # Create a simple KV cache tensor in the expected format [num_pages, 2, page_size, num_heads, head_dim]
-        # For now, use a simple placeholder format
-        page_size = 16  # This should match the backend configuration
-        
-        # Reshape k and v to match FlashInfer expected format
-        # FlashInfer expects: [num_pages, 2, page_size, num_heads, head_dim]
-        # We create a simple 5D tensor for testing
-        num_pages = (total_tokens + page_size - 1) // page_size
-        
-        # Pad to multiple of page_size
-        padded_tokens = num_pages * page_size
-        if padded_tokens > total_tokens:
-            pad_size = padded_tokens - total_tokens
-            k_padded = F.pad(k, (0, 0, 0, 0, 0, pad_size))
-            v_padded = F.pad(v, (0, 0, 0, 0, 0, pad_size))
-        else:
-            k_padded = k
-            v_padded = v
-        
-        # Reshape to [num_pages, page_size, num_heads, head_dim]
-        k_reshaped = k_padded.view(num_pages, page_size, self.num_heads, self.head_dim)
-        v_reshaped = v_padded.view(num_pages, page_size, self.num_heads, self.head_dim)
-        
-        # Stack K and V together: [num_pages, 2, page_size, num_heads, head_dim]
-        kv_cache = torch.stack([k_reshaped, v_reshaped], dim=1)
-        
+        # FlashInfer will handle:
+        # 1. Append K, V to physical KV cache pool (self.backend.kv_cache_pool)
+        # 2. Execute FlashInfer attention computation
         attn_output = self.backend.run(
             query=q,
-            key_cache=kv_cache,
-            value_cache=kv_cache,
+            key_cache=k,  # K for append to physical pool
+            value_cache=v,  # V for append to physical pool
             layer_idx=layer_idx,
             metadata=metadata
         )
         
-        # FlashInfer returns [total_tokens, num_heads, head_dim]
+        # FlashInfer returns [total_tokens, num_heads, head_dim] for GQA
         # Reshape to [total_tokens, hidden_size]
         attn_output = attn_output.view(total_tokens, self.num_heads * self.head_dim)
-        
-        # For unpadding, we keep the flattened format [total_tokens, hidden_size]
-        # No need to reshape back to [batch_size, seq_len, hidden_size]
         
         # Output projection
         output = self.o_proj(attn_output)
