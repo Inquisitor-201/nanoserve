@@ -8,6 +8,7 @@ from .layers import Attention, MLP
 from .models import Qwen3Model, Qwen3DecoderLayer
 from .model_executor import ModelExecutor
 from .block_manager import BlockManager
+from .llm_service import LLMService
 
 __all__ = [
     "AttentionMetadata",
@@ -17,5 +18,6 @@ __all__ = [
     "Qwen3Model",
     "Qwen3DecoderLayer",
     "ModelExecutor",
-    "BlockManager"
+    "BlockManager",
+    "LLMService"
 ]
