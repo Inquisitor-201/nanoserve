@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from core.model_executor import ModelExecutor
 from core.model_loader import ModelLoader
 
-class TestModelLoadingStrict(unittest.TestCase):
+class TestModelLoading(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Initialize ModelExecutor once for the entire test class."""
