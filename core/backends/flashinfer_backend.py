@@ -35,6 +35,7 @@ class FlashInferBackend:
         self,
         num_heads: int,
         head_dim: int,
+        kv_cache_pool: torch.Tensor,
         num_key_value_heads: Optional[int] = None,
         page_size: int = 16,
         dtype: torch.dtype = torch.float16,
@@ -47,6 +48,7 @@ class FlashInferBackend:
         Args:
             num_heads: Number of attention heads (Query heads)
             head_dim: Dimension of each attention head
+            kv_cache_pool: KV cache pool from BlockManager
             num_key_value_heads: Number of key/value heads (for GQA). If None, defaults to num_heads
             page_size: Size of each page in paged KV cache
             dtype: Data type for computations
@@ -64,6 +66,7 @@ class FlashInferBackend:
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
+        self.kv_cache_pool = kv_cache_pool
         
         # Validate GQA configuration
         if num_heads % self.num_key_value_heads != 0:
@@ -172,84 +175,40 @@ class FlashInferBackend:
         Returns:
             Attention output tensor [total_tokens, num_heads, head_dim]
         """
-        print("key_cache shape:", key_cache.shape)
-        print("value_cache shape:", value_cache.shape)
         if metadata is not None and metadata != self._current_metadata:
             # Re-plan if metadata changed
             self.plan(metadata)
         elif not self._is_planned:
             raise RuntimeError("Must call plan() before run()")
         
-        # Store the KV cache for testing purposes
-        self.key_cache = key_cache
-        self.value_cache = value_cache
+        # Get the KV cache layer from the pool
+        kv_cache_layer = self.kv_cache_pool[layer_idx]
         
-        # For prefill, we'll use FlashInfer's prefill wrapper
+        # Store references to the KV cache in the pool for testing
+        # Shape: [num_blocks, page_size, num_key_value_heads, head_dim]
+        self.key_cache = kv_cache_layer[:, 0, :, :, :]  # K is first in the 2nd dimension
+        self.value_cache = kv_cache_layer[:, 1, :, :, :]  # V is second in the 2nd dimension
+        
+        # Create output tensor
+        output = torch.empty_like(query)
+        
+        # Run attention computation using the KV cache pool
         if self._current_metadata.is_prefill:
-            # FlashInfer expects KV cache in paged format (4D or 5D)
-            # We need to reshape the provided KV cache to match this format
-            
-            # For testing, we'll create a simple paged KV cache from the provided tensors
-            # The format should be [num_blocks, page_size, num_key_value_heads, head_dim]
-            page_size = self.page_size
-            total_tokens, num_key_value_heads, head_dim = key_cache.shape
-            
-            # Calculate number of blocks needed
-            num_blocks = (total_tokens + page_size - 1) // page_size
-            
-            # Pad the KV cache to fit into blocks
-            padded_tokens = num_blocks * page_size
-            padded_key_cache = torch.zeros(num_blocks, page_size, num_key_value_heads, head_dim, 
-                                          device=self.device, dtype=self.dtype)
-            padded_value_cache = torch.zeros(num_blocks, page_size, num_key_value_heads, head_dim, 
-                                            device=self.device, dtype=self.dtype)
-            
-            # Copy the actual data into the padded cache
-            padded_key_cache.view(-1, num_key_value_heads, head_dim)[:total_tokens] = key_cache
-            padded_value_cache.view(-1, num_key_value_heads, head_dim)[:total_tokens] = value_cache
-            
-            # Create output tensor
-            output = torch.empty_like(query)
-            
-            # Run prefill using FlashInfer
+            # Run prefill using FlashInfer with the actual KV cache pool
             self.prefill_wrapper.run(
                 query,
-                (padded_key_cache, padded_value_cache),
+                kv_cache_layer,
                 output
             )
-            
-            return output
         else:
-            # For decode, we'll use FlashInfer's decode wrapper
-            # Similar to prefill, we need to reshape the KV cache
-            page_size = self.page_size
-            total_tokens, num_key_value_heads, head_dim = key_cache.shape
-            
-            # Calculate number of blocks needed
-            num_blocks = (total_tokens + page_size - 1) // page_size
-            
-            # Pad the KV cache to fit into blocks
-            padded_tokens = num_blocks * page_size
-            padded_key_cache = torch.zeros(num_blocks, page_size, num_key_value_heads, head_dim, 
-                                          device=self.device, dtype=self.dtype)
-            padded_value_cache = torch.zeros(num_blocks, page_size, num_key_value_heads, head_dim, 
-                                            device=self.device, dtype=self.dtype)
-            
-            # Copy the actual data into the padded cache
-            padded_key_cache.view(-1, num_key_value_heads, head_dim)[:total_tokens] = key_cache
-            padded_value_cache.view(-1, num_key_value_heads, head_dim)[:total_tokens] = value_cache
-            
-            # Create output tensor
-            output = torch.empty_like(query)
-            
-            # Run decode using FlashInfer
+            # Run decode using FlashInfer with the actual KV cache pool
             self.decode_wrapper.run(
                 query,
-                (padded_key_cache, padded_value_cache),
+                kv_cache_layer,
                 output
             )
-            
-            return output
+        
+        return output
     
     def reset_plan_state(self) -> None:
         """Reset the plan state for new batch."""

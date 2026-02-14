@@ -19,10 +19,22 @@ class TestGQA(unittest.TestCase):
         self.device = "cuda"
         self.dtype = torch.float16
         
+        # Create a mock kv_cache_pool for testing
+        # Format: [num_layers, num_blocks, 2, block_size, num_heads, head_dim]
+        num_layers = 1
+        num_blocks = 1
+        block_size = 16
+        self.kv_cache_pool = torch.zeros(
+            (num_layers, num_blocks, 2, block_size, self.num_kv_heads, self.head_dim),
+            dtype=self.dtype,
+            device=self.device
+        )
+        
         # 1. Initialize REAL FlashInfer backend
         self.backend = FlashInferBackend(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
+            kv_cache_pool=self.kv_cache_pool,
             num_key_value_heads=self.num_kv_heads,
             dtype=self.dtype,
             device=self.device

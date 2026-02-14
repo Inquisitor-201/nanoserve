@@ -88,7 +88,8 @@ class ModelExecutor:
                 num_layers=num_layers,
                 attention_backend_type=attention_backend,
                 dtype=dtype,
-                device=device
+                device=device,
+                kv_cache_pool=self.block_manager.kv_cache_pool
             )
             
             # Load model weights if path provided

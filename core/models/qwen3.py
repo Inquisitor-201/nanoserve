@@ -133,7 +133,8 @@ class Qwen3Model(nn.Module):
         dropout: float = 0.0,
         attention_backend_type: str = "flashinfer",
         device: Optional[str] = None,
-        dtype: Optional[torch.dtype] = None
+        dtype: Optional[torch.dtype] = None,
+        kv_cache_pool: Optional[torch.Tensor] = None
     ):
         """
         Initialize Qwen3 model with GQA support.
@@ -151,6 +152,7 @@ class Qwen3Model(nn.Module):
             attention_backend_type: Type of attention backend
             device: Computing device
             dtype: Data type
+            kv_cache_pool: KV cache pool from BlockManager
         """
         super().__init__()
         
@@ -163,8 +165,9 @@ class Qwen3Model(nn.Module):
         if attention_backend_type == "flashinfer":
             self.attention_backend = FlashInferBackend(
                 num_heads=num_heads,
-                num_key_value_heads=self.num_key_value_heads,
                 head_dim=head_dim,
+                kv_cache_pool=kv_cache_pool,
+                num_key_value_heads=self.num_key_value_heads,
                 device=device,
                 dtype=dtype
             )
