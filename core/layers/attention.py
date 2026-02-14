@@ -6,6 +6,7 @@ Provides clean interface for attention computation with various backends.
 from typing import Optional
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import logging
 
 from ..backends import AttentionMetadata
@@ -106,18 +107,43 @@ class Attention(nn.Module):
         v = v.view(total_tokens, self.num_heads, self.head_dim)
         
         # Backend attention computation
-        # For now, we assume key_cache and value_cache are managed by the backend
-        # In a real implementation, these would come from a KV cache manager
-        # Here we pass k and v directly for simplicity
+        # For FlashInfer, we need to format KV cache properly
+        # Create a simple KV cache tensor in the expected format [num_pages, 2, page_size, num_heads, head_dim]
+        # For now, use a simple placeholder format
+        page_size = 16  # This should match the backend configuration
+        
+        # Reshape k and v to match FlashInfer expected format
+        # FlashInfer expects: [num_pages, 2, page_size, num_heads, head_dim]
+        # We create a simple 5D tensor for testing
+        num_pages = (total_tokens + page_size - 1) // page_size
+        
+        # Pad to multiple of page_size
+        padded_tokens = num_pages * page_size
+        if padded_tokens > total_tokens:
+            pad_size = padded_tokens - total_tokens
+            k_padded = F.pad(k, (0, 0, 0, 0, 0, pad_size))
+            v_padded = F.pad(v, (0, 0, 0, 0, 0, pad_size))
+        else:
+            k_padded = k
+            v_padded = v
+        
+        # Reshape to [num_pages, page_size, num_heads, head_dim]
+        k_reshaped = k_padded.view(num_pages, page_size, self.num_heads, self.head_dim)
+        v_reshaped = v_padded.view(num_pages, page_size, self.num_heads, self.head_dim)
+        
+        # Stack K and V together: [num_pages, 2, page_size, num_heads, head_dim]
+        kv_cache = torch.stack([k_reshaped, v_reshaped], dim=1)
+        
         attn_output = self.backend.run(
             query=q,
-            key_cache=k,  # In real implementation, this would be from KV cache
-            value_cache=v,  # In real implementation, this would be from KV cache
+            key_cache=kv_cache,
+            value_cache=kv_cache,
             layer_idx=layer_idx,
             metadata=metadata
         )
         
-        # Reshape back
+        # FlashInfer returns [total_tokens, num_heads, head_dim]
+        # Reshape to [batch_size, seq_len, hidden_size]
         attn_output = attn_output.view(batch_size, seq_len, self.hidden_size)
         
         # Output projection

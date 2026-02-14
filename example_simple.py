@@ -4,6 +4,7 @@ Simple example demonstrating text generation with Qwen3 model.
 """
 
 import logging
+import torch
 from core import LLMService
 
 # Setup logging
@@ -17,13 +18,23 @@ def main():
     print("=" * 40)
     
     try:
-        # Initialize LLM Service
+        # Initialize LLM Service with CUDA
         llm_service = LLMService(device="cuda")
         print(f"✅ LLM Service initialized")
         
-        # Load Qwen3 model
+        # Load Qwen3 model with smaller configuration
         print("\n📦 Loading Qwen3 model...")
-        llm_service.load_model()
+        small_config = {
+            "hidden_size": 512,        # 更小的隐藏层
+            "num_heads": 4,            # 更少的注意力头 - 确保 num_heads * head_dim = hidden_size
+            "head_dim": 128,           # 保持head_dim不变
+            "intermediate_size": 1024, # 更小的中间层
+            "num_layers": 4,           # 更少的层数
+            "dtype": torch.float16,    # 使用float16减少内存使用
+            "num_blocks": 50,          # 更少的KV缓存块
+            "attention_backend": "flashinfer", # 使用flashinfer后端
+        }
+        llm_service.load_model(config=small_config)
         print("✅ Model loaded successfully")
         
         # Simple text generation

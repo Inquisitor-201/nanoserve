@@ -53,7 +53,7 @@ class FlashInferBackend:
         """
         if not FLASHINFER_AVAILABLE:
             raise RuntimeError(
-                "FlashInfer is not installed. Please install with: pip install flashinfer"
+                "FlashInfer is not installed. Please install with: pip install flashinfer-python==0.6.3"
             )
         
         self.num_heads = num_heads

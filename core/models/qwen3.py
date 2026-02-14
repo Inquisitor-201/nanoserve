@@ -157,7 +157,7 @@ class Qwen3Model(nn.Module):
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         
-        # Initialize attention backend
+        # Initialize attention backend - only FlashInfer supported
         if attention_backend_type == "flashinfer":
             self.attention_backend = FlashInferBackend(
                 num_heads=num_heads,
