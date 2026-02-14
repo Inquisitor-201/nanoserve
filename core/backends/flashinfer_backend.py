@@ -87,6 +87,12 @@ class FlashInferBackend:
             self.prefill_workspace, "NHD"
         )
         
+        # Initialize persistent KV cache storage
+        # For testing purposes, we'll create a simple KV cache
+        # In practice, this would be managed by a KV cache pool
+        self.key_cache = None
+        self.value_cache = None
+        
         # Track if we have planned for current batch
         self._current_metadata: Optional[AttentionMetadata] = None
         self._is_planned = False
@@ -154,7 +160,7 @@ class FlashInferBackend:
         metadata: Optional[AttentionMetadata] = None
     ) -> torch.Tensor:
         """
-        Run attention computation with GQA support.
+        Run attention computation with GQA support using FlashInfer API.
         
         Args:
             query: Query tensor [total_tokens, num_heads, head_dim]
@@ -166,111 +172,84 @@ class FlashInferBackend:
         Returns:
             Attention output tensor [total_tokens, num_heads, head_dim]
         """
+        print("key_cache shape:", key_cache.shape)
+        print("value_cache shape:", value_cache.shape)
         if metadata is not None and metadata != self._current_metadata:
             # Re-plan if metadata changed
             self.plan(metadata)
         elif not self._is_planned:
             raise RuntimeError("Must call plan() before run()")
         
-        # For prefill, we need to create a paged KV cache for FlashInfer
-        # FlashInfer expects KV cache to be in a specific format
+        # Store the KV cache for testing purposes
+        self.key_cache = key_cache
+        self.value_cache = value_cache
+        
+        # For prefill, we'll use FlashInfer's prefill wrapper
         if self._current_metadata.is_prefill:
-            # For prefill, we'll use a simple implementation that just runs attention
-            # without actually using the KV cache (since this is just a test)
-            # In practice, we would need to properly manage the KV cache
-            return self._run_prefill_simple(query, key_cache, value_cache)
+            # FlashInfer expects KV cache in paged format (4D or 5D)
+            # We need to reshape the provided KV cache to match this format
+            
+            # For testing, we'll create a simple paged KV cache from the provided tensors
+            # The format should be [num_blocks, page_size, num_key_value_heads, head_dim]
+            page_size = self.page_size
+            total_tokens, num_key_value_heads, head_dim = key_cache.shape
+            
+            # Calculate number of blocks needed
+            num_blocks = (total_tokens + page_size - 1) // page_size
+            
+            # Pad the KV cache to fit into blocks
+            padded_tokens = num_blocks * page_size
+            padded_key_cache = torch.zeros(num_blocks, page_size, num_key_value_heads, head_dim, 
+                                          device=self.device, dtype=self.dtype)
+            padded_value_cache = torch.zeros(num_blocks, page_size, num_key_value_heads, head_dim, 
+                                            device=self.device, dtype=self.dtype)
+            
+            # Copy the actual data into the padded cache
+            padded_key_cache.view(-1, num_key_value_heads, head_dim)[:total_tokens] = key_cache
+            padded_value_cache.view(-1, num_key_value_heads, head_dim)[:total_tokens] = value_cache
+            
+            # Create output tensor
+            output = torch.empty_like(query)
+            
+            # Run prefill using FlashInfer
+            self.prefill_wrapper.run(
+                query,
+                (padded_key_cache, padded_value_cache),
+                output
+            )
+            
+            return output
         else:
-            # For decode, we would also need proper KV cache management
-            return self._run_decode_simple(query, key_cache, value_cache)
-    
-    def _run_prefill_simple(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Simple prefill implementation for testing.
-        
-        Args:
-            query: Query tensor [total_tokens, num_heads, head_dim]
-            key: Key tensor [total_tokens, num_key_value_heads, head_dim]
-            value: Value tensor [total_tokens, num_key_value_heads, head_dim]
+            # For decode, we'll use FlashInfer's decode wrapper
+            # Similar to prefill, we need to reshape the KV cache
+            page_size = self.page_size
+            total_tokens, num_key_value_heads, head_dim = key_cache.shape
             
-        Returns:
-            Attention output tensor [total_tokens, num_heads, head_dim]
-        """
-        # For testing, use a simple attention implementation
-        # This is not efficient, but it works for testing
-        total_tokens, num_heads, head_dim = query.shape
-        _, num_key_value_heads, _ = key.shape
-        
-        # Scale query
-        query = query / (head_dim ** 0.5)
-        
-        # Compute attention scores
-        # For GQA, we need to repeat key and value for each query head group
-        if num_heads != num_key_value_heads:
-            # GQA case: repeat key and value for each query head group
-            key = key.repeat_interleave(self.num_key_value_groups, dim=1)
-            value = value.repeat_interleave(self.num_key_value_groups, dim=1)
-        
-        # Compute attention scores [total_tokens, num_heads, total_tokens]
-        scores = torch.matmul(query, key.transpose(1, 2))
-        
-        # Apply causal mask
-        mask = torch.tril(torch.ones(total_tokens, total_tokens, device=self.device), diagonal=0)
-        mask = mask.unsqueeze(1)  # Add num_heads dimension
-        scores = scores.masked_fill(mask == 0, -float('inf'))
-        
-        # Apply softmax
-        scores = torch.softmax(scores, dim=-1)
-        
-        # Compute attention output
-        output = torch.bmm(scores, value)
-        
-        return output
-    
-    def _run_decode_simple(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Simple decode implementation for testing.
-        
-        Args:
-            query: Query tensor [batch_size, num_heads, head_dim]
-            key: Key tensor [batch_size, num_key_value_heads, seq_length, head_dim]
-            value: Value tensor [batch_size, num_key_value_heads, seq_length, head_dim]
+            # Calculate number of blocks needed
+            num_blocks = (total_tokens + page_size - 1) // page_size
             
-        Returns:
-            Attention output tensor [batch_size, num_heads, head_dim]
-        """
-        # For testing, use a simple attention implementation
-        batch_size, num_heads, head_dim = query.shape
-        _, num_key_value_heads, seq_length, _ = key.shape
-        
-        # Scale query
-        query = query / (head_dim ** 0.5)
-        
-        # For GQA, we need to repeat key and value for each query head group
-        if num_heads != num_key_value_heads:
-            # GQA case: repeat key and value for each query head group
-            key = key.repeat_interleave(self.num_key_value_groups, dim=1)
-            value = value.repeat_interleave(self.num_key_value_groups, dim=1)
-        
-        # Compute attention scores [batch_size, num_heads, seq_length]
-        scores = torch.matmul(query, key.transpose(2, 3))
-        
-        # Apply softmax
-        scores = torch.softmax(scores, dim=-1)
-        
-        # Compute attention output
-        output = torch.matmul(scores, value)
-        
-        return output
+            # Pad the KV cache to fit into blocks
+            padded_tokens = num_blocks * page_size
+            padded_key_cache = torch.zeros(num_blocks, page_size, num_key_value_heads, head_dim, 
+                                          device=self.device, dtype=self.dtype)
+            padded_value_cache = torch.zeros(num_blocks, page_size, num_key_value_heads, head_dim, 
+                                            device=self.device, dtype=self.dtype)
+            
+            # Copy the actual data into the padded cache
+            padded_key_cache.view(-1, num_key_value_heads, head_dim)[:total_tokens] = key_cache
+            padded_value_cache.view(-1, num_key_value_heads, head_dim)[:total_tokens] = value_cache
+            
+            # Create output tensor
+            output = torch.empty_like(query)
+            
+            # Run decode using FlashInfer
+            self.decode_wrapper.run(
+                query,
+                (padded_key_cache, padded_value_cache),
+                output
+            )
+            
+            return output
     
     def reset_plan_state(self) -> None:
         """Reset the plan state for new batch."""
