@@ -40,23 +40,22 @@ class ModelLoader:
         state_dict = load_file(model_file)
         logger.info(f"Loaded {len(state_dict)} parameters from {model_file}")
         
-        # Create a mapping from HF weight names to model weight names
-        mapped_state_dict = {}
+        # Load weights in-place to reduce VRAM usage
         for hf_name, param in state_dict.items():
             # Map the weight name
             mapped_name = ModelLoader._map_weight_name(hf_name)
-            mapped_state_dict[mapped_name] = param
+            
+            # Get the model parameter
+            model_param = model.get_parameter(mapped_name)
+            
+            # Convert dtype and move to device to match model parameter
+            if param.dtype != model_param.dtype:
+                param = param.to(model_param.dtype)
+            
+            # Copy weights in-place without gradients
+            with torch.no_grad():
+                model_param.copy_(param)
         
-        # Convert dtype and move to device
-        for name, param in mapped_state_dict.items():
-            if param.dtype != dtype:
-                param = param.to(dtype)
-            if device != "cpu":
-                param = param.to(device)
-            mapped_state_dict[name] = param
-        
-        # Load weights into model
-        model.load_state_dict(mapped_state_dict, strict=True)
         logger.info("Successfully loaded model weights")
     
     @staticmethod
