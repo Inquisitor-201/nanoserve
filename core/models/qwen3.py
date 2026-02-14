@@ -62,6 +62,7 @@ class Qwen3DecoderLayer(nn.Module):
             num_key_value_heads=num_key_value_heads,
             backend=attention_backend,
             dropout=dropout,
+            bias=False,
             device=device,
             dtype=dtype
         )
@@ -71,6 +72,7 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             dropout=dropout,
+            bias=False,
             device=device,
             dtype=dtype
         )
@@ -194,7 +196,7 @@ class Qwen3Model(nn.Module):
         self.norm = nn.RMSNorm(hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
         
         # Language model head
-        self.lm_head = nn.Linear(hidden_size, vocab_size, device=device, dtype=dtype)
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False, device=device, dtype=dtype)
     
     def forward(
         self,

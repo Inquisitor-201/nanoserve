@@ -40,34 +40,24 @@ class ModelLoader:
         state_dict = load_file(model_file)
         logger.info(f"Loaded {len(state_dict)} parameters from {model_file}")
         
+        # Create a mapping from HF weight names to model weight names
+        mapped_state_dict = {}
+        for hf_name, param in state_dict.items():
+            # Map the weight name
+            mapped_name = ModelLoader._map_weight_name(hf_name)
+            mapped_state_dict[mapped_name] = param
+        
         # Convert dtype and move to device
-        for name, param in state_dict.items():
+        for name, param in mapped_state_dict.items():
             if param.dtype != dtype:
                 param = param.to(dtype)
             if device != "cpu":
                 param = param.to(device)
-            state_dict[name] = param
+            mapped_state_dict[name] = param
         
-        # Load weights into model (simplified - in practice need proper mapping)
-        try:
-            model.load_state_dict(state_dict, strict=False)
-            logger.info("Successfully loaded model weights")
-        except Exception as e:
-            logger.warning(f"Partial weight loading failed: {e}")
-            # Try to load compatible weights
-            model_dict = model.state_dict()
-            compatible_dict = {}
-            for name, param in state_dict.items():
-                # Map common weight names
-                mapped_name = ModelLoader._map_weight_name(name)
-                if mapped_name in model_dict and param.shape == model_dict[mapped_name].shape:
-                    compatible_dict[mapped_name] = param
-                elif name in model_dict and param.shape == model_dict[name].shape:
-                    compatible_dict[name] = param
-            
-            if compatible_dict:
-                model.load_state_dict(compatible_dict, strict=False)
-                logger.info(f"Loaded {len(compatible_dict)} compatible parameters")
+        # Load weights into model
+        model.load_state_dict(mapped_state_dict, strict=True)
+        logger.info("Successfully loaded model weights")
     
     @staticmethod
     def _map_weight_name(hf_name: str) -> str:
