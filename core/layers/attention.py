@@ -143,6 +143,9 @@ class Attention(nn.Module):
         )
         
         # FlashInfer returns [total_tokens, num_heads, head_dim]
+        # Reshape to [total_tokens, hidden_size]
+        attn_output = attn_output.view(total_tokens, self.num_heads * self.head_dim)
+        
         # Reshape to [batch_size, seq_len, hidden_size]
         attn_output = attn_output.view(batch_size, seq_len, self.hidden_size)
         

@@ -24,22 +24,24 @@ def main():
         
         # Load Qwen3 model with smaller configuration
         print("\n📦 Loading Qwen3 model...")
-        small_config = {
-            "hidden_size": 512,        # 更小的隐藏层
-            "num_heads": 4,            # 更少的注意力头 - 确保 num_heads * head_dim = hidden_size
-            "head_dim": 128,           # 保持head_dim不变
-            "intermediate_size": 1024, # 更小的中间层
-            "num_layers": 4,           # 更少的层数
+        
+        # Use the downloaded real model
+        model_path = "/root/nanoserve/models/Qwen3-0.6B"
+        
+        # Load with optimized configuration for the real model
+        real_config = {
             "dtype": torch.float16,    # 使用float16减少内存使用
-            "num_blocks": 50,          # 更少的KV缓存块
+            "num_blocks": 200,         # 为真实模型提供更多KV缓存块
+            "block_size": 16,          # 保持block_size不变
             "attention_backend": "flashinfer", # 使用flashinfer后端
         }
-        llm_service.load_model(config=small_config)
+        
+        llm_service.load_model(model_path=model_path, config=real_config)
         print("✅ Model loaded successfully")
         
         # Simple text generation
         print("\n📝 Generating text...")
-        prompts = ["Hello, world!", "The future of AI is"]
+        prompts = ["Hello, world!", "Please tell me, the future of AI is"]
         
         print(f"Input: {prompts}")
         generated_texts = llm_service.generate(

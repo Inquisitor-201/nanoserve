@@ -6,6 +6,10 @@ Provides high-level API for model loading, configuration, and inference.
 import logging
 from typing import Dict, Any, Optional, List, Union
 import torch
+import json
+import os
+from pathlib import Path
+from transformers import AutoTokenizer, AutoConfig
 
 from .model_executor import ModelExecutor
 from .backends import AttentionMetadata
@@ -35,11 +39,14 @@ class LLMService:
         self.device = device if torch.cuda.is_available() else "cpu"
         self.model_executor: Optional[ModelExecutor] = None
         self.block_manager: Optional[BlockManager] = None
+        self.tokenizer: Optional[AutoTokenizer] = None
+        self.model_config: Optional[Dict[str, Any]] = None
         
         logger.info(f"Initialized LLM Service on device: {self.device}")
     
     def load_model(
         self,
+        model_path: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
         **kwargs
     ) -> str:
@@ -47,6 +54,7 @@ class LLMService:
         Load Qwen3 model with specified configuration.
         
         Args:
+            model_path: Path to the HuggingFace model directory
             config: Model configuration override
             **kwargs: Additional configuration parameters
             
@@ -55,24 +63,65 @@ class LLMService:
         """
         logger.info("Loading Qwen3 model")
         
-        # Default Qwen3 configuration
-        default_config = {
-            "model_name": "qwen3",
-            "vocab_size": 32000,
-            "hidden_size": 4096,
-            "num_heads": 32,
-            "head_dim": 128,
-            "intermediate_size": 11008,
-            "num_layers": 32,
-            "attention_backend": "flashinfer",
-            "dtype": torch.float16,
-            "device": self.device,
-            "num_blocks": 1000,
-            "block_size": 16,
-        }
+        # Load from HuggingFace model if path provided
+        if model_path:
+            logger.info(f"Loading model from {model_path}")
+            
+            # Load tokenizer
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
+            except Exception as e:
+                logger.warning(f"Failed to load fast tokenizer: {e}, trying slow tokenizer")
+                self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
+            
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            # Load model config
+            hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+            self.model_config = hf_config.to_dict()
+            
+            logger.info(f"Loaded model config: {hf_config.model_type}, vocab_size={hf_config.vocab_size}")
+            
+            # Build configuration from HuggingFace config
+            model_config = {
+                "model_name": hf_config.model_type,
+                "vocab_size": hf_config.vocab_size,
+                "hidden_size": hf_config.hidden_size,
+                "num_heads": hf_config.num_attention_heads,
+                "head_dim": getattr(hf_config, 'head_dim', hf_config.hidden_size // hf_config.num_attention_heads),
+                "intermediate_size": hf_config.intermediate_size,
+                "num_layers": hf_config.num_hidden_layers,
+                "attention_backend": "flashinfer",
+                "dtype": torch.float16,  # Use float16 for compatibility
+                "device": self.device,
+                "num_blocks": 1000,
+                "block_size": 16,
+            }
+        else:
+            # Use default configuration
+            logger.info("Using default model configuration")
+            model_config = {
+                "model_name": "qwen3",
+                "vocab_size": 32000,
+                "hidden_size": 4096,
+                "num_heads": 32,
+                "head_dim": 128,
+                "intermediate_size": 11008,
+                "num_layers": 32,
+                "attention_backend": "flashinfer",
+                "dtype": torch.float16,
+                "device": self.device,
+                "num_blocks": 1000,
+                "block_size": 16,
+            }
         
         # Merge configurations (user config overrides defaults)
-        final_config = {**default_config, **(config or {}), **kwargs}
+        final_config = {**model_config, **(config or {}), **kwargs}
+        
+        # Pass model_path to executor if available
+        if model_path:
+            final_config['model_path'] = model_path
         
         # Initialize model executor
         self.model_executor = ModelExecutor(**final_config)
@@ -81,7 +130,7 @@ class LLMService:
         self.block_manager = self.model_executor.block_manager
         
         logger.info("Successfully loaded Qwen3 model")
-        return "qwen3"
+        return final_config["model_name"]
     
     def generate(
         self,
@@ -110,24 +159,43 @@ class LLMService:
         if isinstance(prompts, str):
             prompts = [prompts]
         
-        # Simple tokenization (in production, use proper tokenizer)
-        batch_size = len(prompts)
-        seq_lengths = [len(prompt) for prompt in prompts]
-        max_seq_len = max(seq_lengths)
+        # Use real tokenizer if available
+        if self.tokenizer is not None:
+            # Tokenize prompts
+            encoded = self.tokenizer(
+                prompts,
+                padding=True,
+                truncation=True,
+                return_tensors="pt"
+            )
+            input_ids = encoded["input_ids"].to(self.device)
+            attention_mask = encoded["attention_mask"].to(self.device)
+            
+            batch_size, seq_len = input_ids.shape
+            seq_lengths = attention_mask.sum(dim=1).tolist()
+        else:
+            # Fallback to placeholder tokenization
+            logger.warning("No tokenizer available, using placeholder tokenization")
+            batch_size = len(prompts)
+            seq_lengths = [len(prompt) for prompt in prompts]
+            max_seq_len = max(seq_lengths)
+            
+            # Create random input IDs as placeholder
+            vocab_size = self.model_executor.model.vocab_size if self.model_executor else 32000
+            input_ids = torch.randint(
+                0, vocab_size,
+                (batch_size, max_seq_len),
+                device=self.device,
+                dtype=torch.long
+            )
         
-        # Create input IDs (placeholder - use real tokenizer in production)
-        input_ids = torch.randint(
-            0, 32000,  # vocab_size placeholder
-            (batch_size, max_seq_len),
-            device=self.device,
-            dtype=torch.long
-        )
-        
-        # Create block tables (simplified allocation)
+        # Create block tables for KV cache allocation
         block_tables = []
         for seq_len in seq_lengths:
             num_blocks = (seq_len + self.block_manager.block_size - 1) // self.block_manager.block_size
-            blocks = list(range(num_blocks))
+            blocks = self.block_manager.allocate_blocks(seq_len)
+            if blocks is None:
+                raise RuntimeError(f"Failed to allocate {num_blocks} blocks for sequence length {seq_len}")
             block_tables.append(blocks)
         
         # Execute generation
@@ -140,8 +208,16 @@ class LLMService:
             top_p=top_p
         )
         
-        # Convert back to text (placeholder - use real detokenizer in production)
-        generated_texts = [f"Generated text for prompt: '{prompt}'" for prompt in prompts]
+        # Convert back to text using tokenizer
+        if self.tokenizer is not None:
+            # Detokenize generated IDs
+            generated_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            # Clean up the generated text
+            generated_texts = [text.strip() for text in generated_texts]
+        else:
+            # Fallback to placeholder
+            logger.warning("No tokenizer available for decoding")
+            generated_texts = [f"Generated text for prompt: '{prompt}'" for prompt in prompts]
         
         return generated_texts
     
