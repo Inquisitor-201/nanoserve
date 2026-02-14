@@ -80,21 +80,9 @@ class ModelLoader:
         Returns:
             Mapped weight name
         """
-        # Simple mapping - in practice needs more sophisticated mapping
-        name_mapping = {
-            "model.embed_tokens.weight": "embed_tokens.weight",
-            "model.norm.weight": "norm.weight",
-            "lm_head.weight": "lm_head.weight",
-            # Add more mappings as needed
-        }
+        # Remove 'model.' prefix for all names
+        if hf_name.startswith("model."):
+            return hf_name[6:]  # Remove 'model.' prefix
         
-        # Handle layer-specific mappings
-        if "model.layers." in hf_name:
-            # Convert layers.X to layers[X]
-            parts = hf_name.split('.')
-            if len(parts) >= 3 and parts[1] == "layers":
-                layer_idx = parts[2]
-                remaining = '.'.join(parts[3:])
-                return f"layers.{layer_idx}.{remaining}"
-        
-        return name_mapping.get(hf_name, hf_name)
+        # Return original name if no mapping found
+        return hf_name

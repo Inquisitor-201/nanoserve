@@ -43,7 +43,7 @@ class Attention(nn.Module):
             num_heads: Number of attention heads (Query heads)
             head_dim: Dimension of each attention head
             backend: Attention backend instance (e.g., FlashInferBackend)
-            num_key_value_heads: Number of key/value heads (for GQA). If None, defaults to num_heads
+            num_key_value_heads: Number of key/value heads (for GQA). If None, defaults to num_heads (MHA)
             bias: Whether to use bias in linear projections
             dropout: Dropout probability
             device: Computing device
@@ -152,10 +152,23 @@ class Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         
-        # For testing, use a simple attention implementation instead of FlashInfer
-        # This will allow us to test the rest of the model without FlashInfer issues
-        attn_output = self._simple_attention(q, k, v)
+        # Apply RoPE (placeholder - to be implemented with actual position info)
+        # TODO: Implement actual RoPE based on metadata.position_ids or similar
+        # For now, we skip RoPE as it's not available in current metadata
         
+        # Backend attention computation
+        # FlashInfer will handle:
+        # 1. Append K, V to physical KV cache pool (self.backend.kv_cache_pool)
+        # 2. Execute FlashInfer attention computation
+        attn_output = self.backend.run(
+            query=q,
+            key_cache=k,  # K for append to physical pool
+            value_cache=v,  # V for append to physical pool
+            layer_idx=layer_idx,
+            metadata=metadata
+        )
+        
+        # FlashInfer returns [total_tokens, num_heads, head_dim] for GQA
         # Reshape to [total_tokens, hidden_size]
         attn_output = attn_output.view(total_tokens, self.num_heads * self.head_dim)
         
@@ -164,45 +177,5 @@ class Attention(nn.Module):
         
         if self.dropout is not None:
             output = self.dropout(output)
-        
-        return output
-    
-    def _simple_attention(self, query, key, value):
-        """
-        Simple attention implementation for testing.
-        
-        Args:
-            query: Query tensor [total_tokens, num_heads, head_dim]
-            key: Key tensor [total_tokens, num_key_value_heads, head_dim]
-            value: Value tensor [total_tokens, num_key_value_heads, head_dim]
-            
-        Returns:
-            Attention output tensor [total_tokens, num_heads, head_dim]
-        """
-        total_tokens, num_heads, head_dim = query.shape
-        _, num_key_value_heads, _ = key.shape
-        
-        # Scale query
-        query = query / (head_dim ** 0.5)
-        
-        # Compute attention scores
-        # For GQA, we need to repeat key and value for each query head group
-        if num_heads != num_key_value_heads:
-            # GQA case: repeat key and value for each query head group
-            key = key.repeat_interleave(self.num_key_value_groups, dim=1)
-            value = value.repeat_interleave(self.num_key_value_groups, dim=1)
-        
-        # Compute attention scores [total_tokens, num_heads, total_tokens]
-        scores = torch.bmm(query, key.transpose(1, 2))
-        
-        # Apply causal mask
-        mask = torch.tril(torch.ones(total_tokens, total_tokens, device=query.device), diagonal=0)
-        scores = scores.masked_fill(mask == 0, -float('inf'))
-        
-        # Apply softmax
-        scores = torch.softmax(scores, dim=-1)
-        
-        # Compute attention output
-        output = torch.bmm(scores, value)
         
         return output

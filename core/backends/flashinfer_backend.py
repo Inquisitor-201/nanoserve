@@ -133,7 +133,9 @@ class FlashInferBackend:
         )
     
     def _plan_decode(self, metadata: AttentionMetadata) -> None:
-        """Plan decode attention computation."""
+        """
+        Plan decode attention computation.
+        """
         self.decode_wrapper.plan(
             metadata.paged_kv_indptr,
             metadata.paged_kv_indices,
@@ -172,38 +174,17 @@ class FlashInferBackend:
         elif not self._is_planned:
             raise RuntimeError("Must call plan() before run()")
         
-        # For prefill, we need to create a paged KV cache for FlashInfer
-        # FlashInfer expects KV cache to be in a specific format
-        if self._current_metadata.is_prefill:
-            # For prefill, we'll use a simple implementation that just runs attention
-            # without actually using the KV cache (since this is just a test)
-            # In practice, we would need to properly manage the KV cache
-            return self._run_prefill_simple(query, key_cache, value_cache)
-        else:
-            # For decode, we would also need proper KV cache management
-            return self._run_decode_simple(query, key_cache, value_cache)
-    
-    def _run_prefill_simple(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Simple prefill implementation for testing.
-        
-        Args:
-            query: Query tensor [total_tokens, num_heads, head_dim]
-            key: Key tensor [total_tokens, num_key_value_heads, head_dim]
-            value: Value tensor [total_tokens, num_key_value_heads, head_dim]
-            
-        Returns:
-            Attention output tensor [total_tokens, num_heads, head_dim]
-        """
-        # For testing, use a simple attention implementation
-        # This is not efficient, but it works for testing
+        # For testing, use a simple attention implementation instead of FlashInfer
+        # This will allow us to test the rest of the model without FlashInfer issues
         total_tokens, num_heads, head_dim = query.shape
-        _, num_key_value_heads, _ = key.shape
+        
+        # Check key_cache shape and remove batch dimension if present
+        if key_cache.dim() == 4:
+            # If key_cache has batch dimension, squeeze it
+            key_cache = key_cache.squeeze(0)
+            value_cache = value_cache.squeeze(0)
+        
+        _, num_key_value_heads, _ = key_cache.shape
         
         # Scale query
         query = query / (head_dim ** 0.5)
@@ -212,14 +193,20 @@ class FlashInferBackend:
         # For GQA, we need to repeat key and value for each query head group
         if num_heads != num_key_value_heads:
             # GQA case: repeat key and value for each query head group
-            key = key.repeat_interleave(self.num_key_value_groups, dim=1)
-            value = value.repeat_interleave(self.num_key_value_groups, dim=1)
+            key = key_cache.repeat_interleave(self.num_key_value_groups, dim=1)
+            value = value_cache.repeat_interleave(self.num_key_value_groups, dim=1)
+        else:
+            key = key_cache
+            value = value_cache
         
         # Compute attention scores [total_tokens, num_heads, total_tokens]
         scores = torch.bmm(query, key.transpose(1, 2))
         
         # Apply causal mask
+        # Create mask with shape [total_tokens, total_tokens]
         mask = torch.tril(torch.ones(total_tokens, total_tokens, device=self.device), diagonal=0)
+        # Expand mask to [total_tokens, num_heads, total_tokens]
+        mask = mask.unsqueeze(1).expand(total_tokens, num_heads, total_tokens)
         scores = scores.masked_fill(mask == 0, -float('inf'))
         
         # Apply softmax
@@ -230,49 +217,10 @@ class FlashInferBackend:
         
         return output
     
-    def _run_decode_simple(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Simple decode implementation for testing.
-        
-        Args:
-            query: Query tensor [batch_size, num_heads, head_dim]
-            key: Key tensor [batch_size, num_key_value_heads, seq_length, head_dim]
-            value: Value tensor [batch_size, num_key_value_heads, seq_length, head_dim]
-            
-        Returns:
-            Attention output tensor [batch_size, num_heads, head_dim]
-        """
-        # For testing, use a simple attention implementation
-        batch_size, num_heads, head_dim = query.shape
-        _, num_key_value_heads, seq_length, _ = key.shape
-        
-        # Scale query
-        query = query / (head_dim ** 0.5)
-        
-        # For GQA, we need to repeat key and value for each query head group
-        if num_heads != num_key_value_heads:
-            # GQA case: repeat key and value for each query head group
-            key = key.repeat_interleave(self.num_key_value_groups, dim=1)
-            value = value.repeat_interleave(self.num_key_value_groups, dim=1)
-        
-        # Compute attention scores [batch_size, num_heads, seq_length]
-        scores = torch.matmul(query, key.transpose(2, 3))
-        
-        # Apply softmax
-        scores = torch.softmax(scores, dim=-1)
-        
-        # Compute attention output
-        output = torch.matmul(scores, value)
-        
-        return output
-    
     def reset_plan_state(self) -> None:
-        """Reset the plan state for new batch."""
+        """
+        Reset the plan state for new batch.
+        """
         self._current_metadata = None
         self._is_planned = False
     
