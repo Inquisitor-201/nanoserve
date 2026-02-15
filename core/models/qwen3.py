@@ -29,7 +29,6 @@ class Qwen3DecoderLayer(nn.Module):
         layer_idx: int,
         num_key_value_heads: Optional[int] = None,
         rms_norm_eps: float = 1e-6,
-        dropout: float = 0.0,
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None
     ):
@@ -45,7 +44,6 @@ class Qwen3DecoderLayer(nn.Module):
             layer_idx: Layer index
             num_key_value_heads: Number of key/value heads (for GQA). If None, defaults to num_heads
             rms_norm_eps: RMS norm epsilon
-            dropout: Dropout probability
             device: Computing device
             dtype: Data type
         """
@@ -61,7 +59,7 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=head_dim,
             num_key_value_heads=num_key_value_heads,
             backend=attention_backend,
-            dropout=dropout,
+            layer_idx=layer_idx,
             bias=False,
             device=device,
             dtype=dtype
@@ -71,7 +69,6 @@ class Qwen3DecoderLayer(nn.Module):
         self.mlp = MLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            dropout=dropout,
             bias=False,
             device=device,
             dtype=dtype
@@ -99,7 +96,7 @@ class Qwen3DecoderLayer(nn.Module):
         # Self-attention with residual connection
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, metadata, layer_idx=self.layer_idx)
+        hidden_states = self.self_attn(hidden_states, metadata)
         hidden_states = residual + hidden_states
         
         # MLP with residual connection
@@ -130,7 +127,6 @@ class Qwen3Model(nn.Module):
         num_layers: int,
         num_key_value_heads: Optional[int] = None,
         rms_norm_eps: float = 1e-6,
-        dropout: float = 0.0,
         attention_backend_type: str = "flashinfer",
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
@@ -148,7 +144,6 @@ class Qwen3Model(nn.Module):
             num_layers: Number of decoder layers
             num_key_value_heads: Number of key/value heads (for GQA). If None, defaults to num_heads
             rms_norm_eps: RMS norm epsilon
-            dropout: Dropout probability
             attention_backend_type: Type of attention backend
             device: Computing device
             dtype: Data type
@@ -188,7 +183,6 @@ class Qwen3Model(nn.Module):
                 layer_idx=i,
                 num_key_value_heads=self.num_key_value_heads,
                 rms_norm_eps=rms_norm_eps,
-                dropout=dropout,
                 device=device,
                 dtype=dtype
             )

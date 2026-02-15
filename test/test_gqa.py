@@ -49,6 +49,7 @@ class TestGQA(unittest.TestCase):
             head_dim=self.head_dim,
             num_key_value_heads=self.num_kv_heads,
             backend=self.backend,
+            layer_idx=0,
             device=self.device,
             dtype=self.dtype
         )

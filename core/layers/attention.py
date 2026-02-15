@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import logging
+from functools import partial
 
 from ..backends import AttentionMetadata
 
@@ -28,6 +29,7 @@ class Attention(nn.Module):
         num_heads: int,
         head_dim: int,
         backend,
+        layer_idx: int,
         num_key_value_heads: Optional[int] = None,
         bias: bool = True,
         device: Optional[str] = None,
@@ -41,6 +43,7 @@ class Attention(nn.Module):
             num_heads: Number of attention heads (Query heads)
             head_dim: Dimension of each attention head
             backend: Attention backend instance (e.g., FlashInferBackend)
+            layer_idx: Layer index for KV cache pool access
             num_key_value_heads: Number of key/value heads (for GQA). If None, defaults to num_heads (MHA)
             bias: Whether to use bias in linear projections
             device: Computing device
@@ -52,6 +55,7 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_key_value_heads = num_key_value_heads or num_heads
+        self.layer_idx = layer_idx
         self.backend = backend
         
         if num_heads % self.num_key_value_heads != 0:
@@ -93,15 +97,20 @@ class Attention(nn.Module):
             dtype=dtype
         )
         
-        logger.info(f"Initialized GQA Attention: hidden_size={hidden_size}, num_heads={num_heads}, "
+        self._run_op = partial(
+            self.backend.run,
+            layer_idx=self.layer_idx
+        )
+        
+        logger.info(f"Initialized GQA Attention (layer_idx={layer_idx}): "
+                   f"hidden_size={hidden_size}, num_heads={num_heads}, "
                    f"num_key_value_heads={self.num_key_value_heads}, head_dim={head_dim}, "
                    f"num_key_value_groups={self.num_key_value_groups}")
     
     def forward(
         self,
         hidden_states: torch.Tensor,
-        metadata: AttentionMetadata,
-        layer_idx: int = 0
+        metadata: AttentionMetadata
     ) -> torch.Tensor:
         """
         Forward pass of GQA attention layer with FlashInfer physical pool support.
@@ -109,7 +118,6 @@ class Attention(nn.Module):
         Args:
             hidden_states: Input hidden states (flattened: [total_tokens, hidden_size])
             metadata: Attention metadata for backend
-            layer_idx: Layer index for multi-layer models
             
         Returns:
             Output hidden states (flattened: [total_tokens, hidden_size])
@@ -127,11 +135,10 @@ class Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         
-        attn_output = self.backend.run(
+        attn_output = self._run_op(
             query=q,
             key_states=k,
             value_states=v,
-            layer_idx=layer_idx,
             metadata=metadata
         )
         
