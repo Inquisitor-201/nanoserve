@@ -57,32 +57,44 @@ class TestModelLoading(unittest.TestCase):
 
     def test_02_weight_exact_match(self):
         """
-        Verify that loaded weights exactly match the source safetensors values.
+        Verify that EVERY loaded weight exactly matches the source safetensors values.
         Checks for data corruption during loading/casting.
+        This test validates complete weight integrity - not just subset.
         """
         model_state = self.executor.model.state_dict()
-        mismatched_layers = []
-
-        # We check a subset of layers to save time, or all if needed
-        # Checking Layer 0, Layer 14 (middle), and Layer 27 (last) + Embeddings
-        check_patterns = ["layers.0.", "layers.14.", "layers.27.", "embed_tokens", "lm_head"]
-
+        mismatched_keys = []
+        checked_count = 0
+        
+        # Check EVERY weight in safetensors, not just a subset
         for hf_key, ref_tensor in self.ref_weights.items():
             mapped_key = ModelLoader._map_weight_name(hf_key)
             
-            # Filter to check only relevant keys based on our config
-            if any(pattern in mapped_key for pattern in check_patterns):
-                if mapped_key in model_state:
-                    model_tensor = model_state[mapped_key].cpu() # Move to CPU for comparison
-                    ref_tensor_comp = ref_tensor.to(dtype=self.config["dtype"])
-                    
-                    # Use a small epsilon for float16 comparison
-                    # torch.allclose is better than == for half precision
-                    if not torch.allclose(model_tensor, ref_tensor_comp, atol=1e-3, rtol=1e-3):
-                        mismatched_layers.append(mapped_key)
+            if mapped_key in model_state:
+                checked_count += 1
+                model_tensor = model_state[mapped_key].cpu()
+                ref_tensor_comp = ref_tensor.to(dtype=self.config["dtype"])
+                
+                # torch.allclose with appropriate tolerances for float16
+                if not torch.allclose(model_tensor, ref_tensor_comp, atol=1e-3, rtol=1e-3):
+                    mismatched_keys.append({
+                        "hf_key": hf_key,
+                        "mapped_key": mapped_key,
+                        "max_diff": (model_tensor - ref_tensor_comp).abs().max().item()
+                    })
         
-        self.assertEqual(len(mismatched_layers), 0, f"Numerical mismatch in weights: {mismatched_layers}")
-        print(f"[OK] Exact match verification passed for {len(self.ref_weights)} potential tensors.")
+        # Report results
+        if mismatched_keys:
+            first_mismatch = mismatched_keys[0]
+            self.fail(
+                f"Weight mismatch detected!\n"
+                f"Checked {checked_count}/{len(self.ref_weights)} weights from safetensors.\n"
+                f"First mismatch: {first_mismatch['hf_key']} -> {first_mismatch['mapped_key']}\n"
+                f"Max diff: {first_mismatch['max_diff']:.6f}"
+            )
+        else:
+            self.assertEqual(checked_count, len(self.ref_weights), 
+                           f"Not all weights were checked: {checked_count} vs {len(self.ref_weights)}")
+            print(f"[OK] All {checked_count} weights from safetensors match exactly.")
 
     def test_03_weight_values_fingerprint(self):
         """Verify weights are not zero or random by checking statistical fingerprint."""
