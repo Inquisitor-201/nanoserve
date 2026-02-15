@@ -7,15 +7,8 @@ from typing import Optional, Tuple
 import torch
 import logging
 
-try:
-    import flashinfer
-    from flashinfer import BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper
-    FLASHINFER_AVAILABLE = True
-except ImportError:
-    FLASHINFER_AVAILABLE = False
-    flashinfer = None
-    BatchDecodeWithPagedKVCacheWrapper = None
-    BatchPrefillWithPagedKVCacheWrapper = None
+import flashinfer
+from flashinfer import BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper
 
 from .metadata import AttentionMetadata
 
@@ -55,11 +48,6 @@ class FlashInferBackend:
             device: Computing device
             workspace_size_mb: Size of workspace buffer in MB
         """
-        if not FLASHINFER_AVAILABLE:
-            raise RuntimeError(
-                "FlashInfer is not installed. Please install with: pip install flashinfer-python==0.6.3"
-            )
-        
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_key_value_heads = num_key_value_heads or num_heads
@@ -68,12 +56,10 @@ class FlashInferBackend:
         self.device = device
         self.kv_cache_pool = kv_cache_pool
         
-        # Validate GQA configuration
         if num_heads % self.num_key_value_heads != 0:
             raise ValueError(f"num_heads ({num_heads}) must be divisible by num_key_value_heads ({self.num_key_value_heads})")
         self.num_key_value_groups = num_heads // self.num_key_value_heads
         
-        # Initialize workspace buffers
         workspace_size = workspace_size_mb * 1024 * 1024
         self.decode_workspace = torch.empty(
             workspace_size, dtype=torch.uint8, device=device
@@ -82,7 +68,6 @@ class FlashInferBackend:
             workspace_size, dtype=torch.uint8, device=device
         )
         
-        # Initialize wrappers
         self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
             self.decode_workspace, "NHD"
         )
@@ -90,13 +75,6 @@ class FlashInferBackend:
             self.prefill_workspace, "NHD"
         )
         
-        # Initialize persistent KV cache storage
-        # For testing purposes, we'll create a simple KV cache
-        # In practice, this would be managed by a KV cache pool
-        self.key_cache = None
-        self.value_cache = None
-        
-        # Track if we have planned for current batch
         self._current_metadata: Optional[AttentionMetadata] = None
         self._is_planned = False
         
@@ -132,10 +110,10 @@ class FlashInferBackend:
             metadata.paged_kv_indptr,
             metadata.paged_kv_indices,
             metadata.paged_kv_last_page_len,
-            self.num_heads,              # num_qo_heads
-            self.num_key_value_heads,    # num_kv_heads (GQA support)
-            self.head_dim,               # head_dim_qk
-            self.page_size,              # page_size
+            self.num_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+            self.page_size,
             causal=metadata.causal,
             q_data_type=self.dtype,
             kv_data_type=self.dtype,
@@ -147,18 +125,18 @@ class FlashInferBackend:
             metadata.paged_kv_indptr,
             metadata.paged_kv_indices,
             metadata.paged_kv_last_page_len,
-            self.num_heads,              # num_qo_heads
-            self.num_key_value_heads,    # num_kv_heads (GQA support)
-            self.head_dim,               # head_dim
-            self.page_size,              # page_size
+            self.num_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+            self.page_size,
             data_type=self.dtype,
         )
     
     def run(
         self,
         query: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
         layer_idx: int = 0,
         metadata: Optional[AttentionMetadata] = None
     ) -> torch.Tensor:
@@ -167,8 +145,10 @@ class FlashInferBackend:
         
         Args:
             query: Query tensor [total_tokens, num_heads, head_dim]
-            key_cache: Key cache tensor [total_tokens, num_key_value_heads, head_dim]
-            value_cache: Value cache tensor [total_tokens, num_key_value_heads, head_dim]
+            key_states: Key states tensor [total_tokens, num_key_value_heads, head_dim]
+                       (to be written to KV cache pool)
+            value_states: Value states tensor [total_tokens, num_key_value_heads, head_dim]
+                         (to be written to KV cache pool)
             layer_idx: Layer index for multi-layer support
             metadata: Optional metadata override
             
@@ -176,33 +156,37 @@ class FlashInferBackend:
             Attention output tensor [total_tokens, num_heads, head_dim]
         """
         if metadata is not None and metadata != self._current_metadata:
-            # Re-plan if metadata changed
             self.plan(metadata)
         elif not self._is_planned:
             raise RuntimeError("Must call plan() before run()")
         
-        # Get the KV cache layer from the pool
         kv_cache_layer = self.kv_cache_pool[layer_idx]
         
-        # Store references to the KV cache in the pool for testing
-        # Shape: [num_blocks, page_size, num_key_value_heads, head_dim]
-        self.key_cache = kv_cache_layer[:, 0, :, :, :]  # K is first in the 2nd dimension
-        self.value_cache = kv_cache_layer[:, 1, :, :, :]  # V is second in the 2nd dimension
+        total_tokens = key_states.shape[0]
+        device = key_states.device
         
-        # Create output tensor
-        output = torch.empty_like(query)
+        batch_indices = torch.zeros(total_tokens, dtype=torch.int32, device=device)
+        positions = torch.arange(total_tokens, dtype=torch.int32, device=device)
         
-        # Run attention computation using the KV cache pool
+        flashinfer.append_paged_kv_cache(
+            key_states,
+            value_states,
+            batch_indices,
+            positions,
+            kv_cache_layer,
+            metadata.paged_kv_indices,
+            metadata.paged_kv_indptr,
+            metadata.paged_kv_last_page_len,
+            kv_layout="NHD"
+        )
+        
         if self._current_metadata.is_prefill:
-            # Run prefill using FlashInfer with the actual KV cache pool
-            self.prefill_wrapper.run(
+            output = self.prefill_wrapper.run(
                 query,
                 kv_cache_layer,
-                output
             )
         else:
-            # Run decode using FlashInfer with the actual KV cache pool
-            self.decode_wrapper.run(
+            output = self.decode_wrapper.run(
                 query,
                 kv_cache_layer,
                 output

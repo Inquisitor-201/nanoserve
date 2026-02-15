@@ -156,40 +156,14 @@ class Attention(nn.Module):
         # TODO: Implement actual RoPE based on metadata.position_ids or similar
         # For now, we skip RoPE as it's not available in current metadata
         
-        # Use FlashInfer's append_paged_kv_cache to write KV to the pool
-        # This is a single CUDA kernel that efficiently copies KV to the pool
-        if hasattr(self.backend, 'kv_cache_pool') and self.backend.kv_cache_pool is not None:
-            # Get the target layer slice from the KV cache pool
-            kv_cache_layer = self.backend.kv_cache_pool[layer_idx]
-            
-            # Call FlashInfer's append function
-            import flashinfer
-            # Create batch_indices and positions tensors for the append operation
-            # For prefill, we can create simple tensors based on the sequence lengths
-            total_tokens = k.shape[0]
-            device = k.device  # Get device from the tensor
-            batch_indices = torch.zeros(total_tokens, dtype=torch.int32, device=device)
-            positions = torch.arange(total_tokens, dtype=torch.int32, device=device)
-            
-            # Call the function with the correct parameters in the right order
-            flashinfer.append_paged_kv_cache(
-                k,  # append_key
-                v,  # append_value
-                batch_indices,  # batch_indices
-                positions,  # positions
-                kv_cache_layer,  # paged_kv_cache
-                metadata.paged_kv_indices,  # kv_indices
-                metadata.paged_kv_indptr,  # kv_indptr
-                metadata.paged_kv_last_page_len,  # kv_last_page_len
-                kv_layout="NHD"  # kv_layout
-            )
-        
         # Backend attention computation
-        # FlashInfer will handle the attention computation
+        # Backend will handle:
+        # 1. Writing key_states, value_states to KV cache pool (append operation)
+        # 2. Performing attention computation
         attn_output = self.backend.run(
             query=q,
-            key_cache=k,  # K for attention computation
-            value_cache=v,  # V for attention computation
+            key_states=k,
+            value_states=v,
             layer_idx=layer_idx,
             metadata=metadata
         )

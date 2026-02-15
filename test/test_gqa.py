@@ -10,6 +10,8 @@ from core.backends.metadata import AttentionMetadata
 from core.layers.attention import Attention
 from core.backends.flashinfer_backend import FlashInferBackend
 
+torch.manual_seed(42)
+
 class TestGQA(unittest.TestCase):
     def setUp(self):
         self.hidden_size = 512
@@ -24,7 +26,7 @@ class TestGQA(unittest.TestCase):
         num_layers = 1
         num_blocks = 1
         block_size = 16
-        self.kv_cache_pool = torch.zeros(
+        self.kv_cache_pool = torch.randn(
             (num_layers, num_blocks, 2, block_size, self.num_kv_heads, self.head_dim),
             dtype=self.dtype,
             device=self.device
@@ -69,6 +71,9 @@ class TestGQA(unittest.TestCase):
         with torch.inference_mode():
             output = self.attention.forward(hidden_states, metadata)
 
+        # Check output shape
+        self.assertEqual(output.shape, (seq_len, self.hidden_size), "Output shape mismatch.")
+
         # 1. Check for non-zero output (if weights are loaded/init, output shouldn't be zero)
         self.assertGreater(output.abs().mean().item(), 1e-5, "Attention output is suspiciously near zero.")
         
@@ -105,11 +110,11 @@ class TestGQA(unittest.TestCase):
             # ASSERTION: The backend MUST have a way to store these.
             # If your FlashInferBackend currently has no 'kv_cache' attribute, 
             # this test will fail, forcing the Agent to implement the storage logic.
-            if hasattr(self.backend, 'key_cache') and self.backend.key_cache is not None:
+            if hasattr(self.backend, 'kv_cache_pool') and self.backend.kv_cache_pool is not None:
                 # Check if the values in cache match the projected K
                 # We check the first few elements of the first block
-                cached_k = self.backend.key_cache[0, :seq_len, :, :] # Assuming [num_blocks, page_size, num_kv_heads, head_dim]
-                torch.testing.assert_close(cached_k, expected_k, atol=1e-3, rtol=1e-3)
+                cached_k = self.backend.kv_cache_pool[0, 0, 0, :seq_len, :, :] # Assuming [num_blocks, page_size, num_kv_heads, head_dim]
+                torch.testing.assert_close(cached_k, expected_k, atol=1e-4, rtol=1e-4)
             else:
                 self.fail("Backend does not have a persistent KV cache storage implemented!")
 
