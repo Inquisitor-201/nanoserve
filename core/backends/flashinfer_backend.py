@@ -180,16 +180,19 @@ class FlashInferBackend:
             kv_layout="NHD"
         )
         
+        output = torch.empty_like(query)
+        
         if self._current_metadata.is_prefill:
             output = self.prefill_wrapper.run(
-                query,
-                kv_cache_layer,
+                q=query,
+                paged_kv_cache=kv_cache_layer,
+                out=output
             )
         else:
             output = self.decode_wrapper.run(
-                query,
-                kv_cache_layer,
-                output
+                q=query,
+                kv_cache_layer=kv_cache_layer,
+                output=output
             )
         
         return output

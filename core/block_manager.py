@@ -29,7 +29,7 @@ class BlockManager:
         self,
         num_blocks: int,
         num_layers: int,
-        num_heads: int,
+        num_key_value_heads: int,
         head_dim: int,
         block_size: int,
         dtype: torch.dtype = torch.float16,
@@ -41,7 +41,7 @@ class BlockManager:
         Args:
             num_blocks: Total number of physical blocks
             num_layers: Number of transformer layers
-            num_heads: Number of attention heads
+            num_key_value_heads: Number of key/value heads (for GQA)
             head_dim: Dimension of each attention head
             block_size: Size of each block in tokens
             dtype: Data type for the tensor
@@ -49,14 +49,14 @@ class BlockManager:
         """
         self.num_blocks = num_blocks
         self.num_layers = num_layers
-        self.num_heads = num_heads
+        self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
         self.block_size = block_size
         self.dtype = dtype
         self.device = device
         
         self.kv_cache_pool = torch.zeros(
-            (num_layers, num_blocks, 2, block_size, num_heads, head_dim),
+            (num_layers, num_blocks, 2, block_size, num_key_value_heads, head_dim),
             dtype=dtype,
             device=device
         )

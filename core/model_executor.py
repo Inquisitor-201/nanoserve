@@ -69,7 +69,7 @@ class ModelExecutor:
         self.block_manager = BlockManager(
             num_blocks=num_blocks,
             num_layers=num_layers,
-            num_heads=num_heads,
+            num_key_value_heads=num_key_value_heads,
             head_dim=head_dim,
             block_size=block_size,
             dtype=dtype,

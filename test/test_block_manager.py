@@ -22,14 +22,14 @@ class TestBlockManager(unittest.TestCase):
         """Set up test fixtures."""
         self.num_blocks = 10
         self.num_layers = 2
-        self.num_heads = 8
+        self.num_key_value_heads = 8
         self.head_dim = 64
         self.block_size = 16
         
         self.block_manager = BlockManager(
             num_blocks=self.num_blocks,
             num_layers=self.num_layers,
-            num_heads=self.num_heads,
+            num_key_value_heads=self.num_key_value_heads,
             head_dim=self.head_dim,
             block_size=self.block_size,
             dtype=torch.float32,
@@ -43,7 +43,7 @@ class TestBlockManager(unittest.TestCase):
             self.num_blocks, 
             2,  # K and V
             self.block_size, 
-            self.num_heads, 
+            self.num_key_value_heads, 
             self.head_dim
         )
         self.assertEqual(self.block_manager.kv_cache_pool.shape, expected_shape)
