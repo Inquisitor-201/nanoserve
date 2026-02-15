@@ -6,7 +6,6 @@ Provides clean interface for attention computation with various backends.
 from typing import Optional
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import logging
 
 from ..backends import AttentionMetadata
@@ -31,7 +30,6 @@ class Attention(nn.Module):
         backend,
         num_key_value_heads: Optional[int] = None,
         bias: bool = True,
-        dropout: float = 0.0,
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None
     ):
@@ -45,7 +43,6 @@ class Attention(nn.Module):
             backend: Attention backend instance (e.g., FlashInferBackend)
             num_key_value_heads: Number of key/value heads (for GQA). If None, defaults to num_heads (MHA)
             bias: Whether to use bias in linear projections
-            dropout: Dropout probability
             device: Computing device
             dtype: Data type
         """
@@ -57,13 +54,10 @@ class Attention(nn.Module):
         self.num_key_value_heads = num_key_value_heads or num_heads
         self.backend = backend
         
-        # Validate GQA configuration
         if num_heads % self.num_key_value_heads != 0:
             raise ValueError(f"num_heads ({num_heads}) must be divisible by num_key_value_heads ({self.num_key_value_heads})")
         self.num_key_value_groups = num_heads // self.num_key_value_heads
         
-        # Separate projections for Q, K, V (matching Qwen3 weight structure)
-        # Q projection: [hidden_size, num_heads * head_dim]
         self.q_proj = nn.Linear(
             hidden_size,
             num_heads * head_dim,
@@ -72,7 +66,6 @@ class Attention(nn.Module):
             dtype=dtype
         )
         
-        # K projection: [hidden_size, num_key_value_heads * head_dim]
         self.k_proj = nn.Linear(
             hidden_size,
             self.num_key_value_heads * head_dim,
@@ -81,7 +74,6 @@ class Attention(nn.Module):
             dtype=dtype
         )
         
-        # V projection: [hidden_size, num_key_value_heads * head_dim]
         self.v_proj = nn.Linear(
             hidden_size,
             self.num_key_value_heads * head_dim,
@@ -90,12 +82,9 @@ class Attention(nn.Module):
             dtype=dtype
         )
         
-        # Q and K layer norms (matching Qwen3 weight structure)
-        # Remove bias since weights file doesn't have bias for these norms
         self.q_norm = nn.LayerNorm(head_dim, eps=1e-6, bias=False, device=device, dtype=dtype)
         self.k_norm = nn.LayerNorm(head_dim, eps=1e-6, bias=False, device=device, dtype=dtype)
         
-        # Output projection
         self.o_proj = nn.Linear(
             num_heads * head_dim,
             hidden_size,
@@ -103,8 +92,6 @@ class Attention(nn.Module):
             device=device,
             dtype=dtype
         )
-        
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else None
         
         logger.info(f"Initialized GQA Attention: hidden_size={hidden_size}, num_heads={num_heads}, "
                    f"num_key_value_heads={self.num_key_value_heads}, head_dim={head_dim}, "
@@ -127,39 +114,19 @@ class Attention(nn.Module):
         Returns:
             Output hidden states (flattened: [total_tokens, hidden_size])
         """
-        # For unpadding, hidden_states is already flattened: [total_tokens, hidden_size]
         total_tokens, hidden_size = hidden_states.shape
         
-        # Separate Q, K, V projections (matching Qwen3 weight structure)
-        # Q projection: [total_tokens, num_heads * head_dim]
         q = self.q_proj(hidden_states)
-        
-        # K projection: [total_tokens, num_key_value_heads * head_dim]
         k = self.k_proj(hidden_states)
-        
-        # V projection: [total_tokens, num_key_value_heads * head_dim]
         v = self.v_proj(hidden_states)
         
-        # Reshape for attention computation
-        # Q: [total_tokens, num_heads, head_dim]
         q = q.view(total_tokens, self.num_heads, self.head_dim)
-        
-        # K, V: [total_tokens, num_key_value_heads, head_dim]
         k = k.view(total_tokens, self.num_key_value_heads, self.head_dim)
         v = v.view(total_tokens, self.num_key_value_heads, self.head_dim)
         
-        # Apply layer norms (matching Qwen3 weight structure)
         q = self.q_norm(q)
         k = self.k_norm(k)
         
-        # Apply RoPE (placeholder - to be implemented with actual position info)
-        # TODO: Implement actual RoPE based on metadata.position_ids or similar
-        # For now, we skip RoPE as it's not available in current metadata
-        
-        # Backend attention computation
-        # Backend will handle:
-        # 1. Writing key_states, value_states to KV cache pool (append operation)
-        # 2. Performing attention computation
         attn_output = self.backend.run(
             query=q,
             key_states=k,
@@ -168,14 +135,8 @@ class Attention(nn.Module):
             metadata=metadata
         )
         
-        # FlashInfer returns [total_tokens, num_heads, head_dim] for GQA
-        # Reshape to [total_tokens, hidden_size]
         attn_output = attn_output.view(total_tokens, self.num_heads * self.head_dim)
         
-        # Output projection
         output = self.o_proj(attn_output)
-        
-        if self.dropout is not None:
-            output = self.dropout(output)
         
         return output

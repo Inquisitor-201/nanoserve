@@ -20,7 +20,6 @@ class MLP(nn.Module):
         hidden_size: int,
         intermediate_size: Optional[int] = None,
         bias: bool = True,
-        dropout: float = 0.0,
         activation: str = "gelu",
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None
@@ -32,7 +31,6 @@ class MLP(nn.Module):
             hidden_size: Input and output hidden size
             intermediate_size: Intermediate size (defaults to 4 * hidden_size)
             bias: Whether to use bias in linear layers
-            dropout: Dropout probability
             activation: Activation function ('gelu', 'relu', 'silu')
             device: Computing device
             dtype: Data type
@@ -42,7 +40,6 @@ class MLP(nn.Module):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size or 4 * hidden_size
         
-        # Gate projection (first linear layer)
         self.gate_proj = nn.Linear(
             hidden_size,
             self.intermediate_size,
@@ -51,7 +48,6 @@ class MLP(nn.Module):
             dtype=dtype
         )
         
-        # Up projection (second linear layer)
         self.up_proj = nn.Linear(
             hidden_size,
             self.intermediate_size,
@@ -60,7 +56,6 @@ class MLP(nn.Module):
             dtype=dtype
         )
         
-        # Down projection (third linear layer)
         self.down_proj = nn.Linear(
             self.intermediate_size,
             hidden_size,
@@ -69,7 +64,6 @@ class MLP(nn.Module):
             dtype=dtype
         )
         
-        # Activation function
         if activation == "gelu":
             self.activation = nn.GELU()
         elif activation == "relu":
@@ -78,9 +72,6 @@ class MLP(nn.Module):
             self.activation = nn.SiLU()
         else:
             raise ValueError(f"Unsupported activation: {activation}")
-        
-        # Dropout
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else None
     
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
@@ -92,17 +83,11 @@ class MLP(nn.Module):
         Returns:
             Output hidden states
         """
-        # First linear layer + activation
         gate = self.gate_proj(hidden_states)
         up = self.up_proj(hidden_states)
         intermediate = self.activation(gate * up)
         
-        # Third linear layer
         output = self.down_proj(intermediate)
-        
-        # Dropout
-        if self.dropout is not None:
-            output = self.dropout(output)
         
         return output
     
