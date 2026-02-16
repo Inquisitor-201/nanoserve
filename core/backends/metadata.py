@@ -125,36 +125,31 @@ class AttentionMetadata:
         paged_kv_indices = torch.tensor(flat_indices, dtype=torch.int32, device=device)
         paged_kv_indptr = torch.tensor(indptr, dtype=torch.int32, device=device)
         paged_kv_last_page_len = torch.tensor(last_page_len, dtype=torch.int32, device=device)
-        
-        # Build qo_indptr from sequence lengths
-        if is_prefill:
-            seq_lengths_tensor = torch.tensor(seq_lengths, dtype=torch.int32, device=device)
-            qo_indptr_tensor = torch.cat([
-                torch.zeros(1, dtype=torch.int32, device=device),
-                torch.cumsum(seq_lengths_tensor, dim=0)
-            ])
-        else:
-            qo_indptr_tensor = None
-        
-        # Generate geometric metadata for FlashInfer operators
+
+        # Build geometric metadata for FlashInfer operators
         batch_size = len(seq_lengths)
         seq_lens_tensor = torch.tensor(seq_lengths, dtype=torch.int32, device=device)
+
         if is_prefill:
-            # Prefill: 
+            qo_indptr_tensor = torch.cat([
+                torch.zeros(1, dtype=torch.int32, device=device),
+                torch.cumsum(seq_lens_tensor, dim=0)
+            ])
+
             batch_indices = torch.repeat_interleave(
                 torch.arange(batch_size, dtype=torch.int32, device=device),
                 seq_lens_tensor
             )
 
-            total_tokens = seq_lens_tensor.sum().item()
-            q_positions = torch.arange(total_tokens, dtype=torch.int32, device=device)
-            q_indptr = torch.cat([
-                torch.tensor([0], dtype=torch.int32, device=device),
-                torch.cumsum(seq_lens_tensor, dim=0)[:-1]
-            ])
-            q_offsets = torch.repeat_interleave(q_indptr, seq_lens_tensor)
-            positions = q_positions - q_offsets
+            total_tokens = int(seq_lens_tensor.sum())
+            positions = torch.arange(total_tokens, dtype=torch.int32, device=device)
+            q_offsets = torch.repeat_interleave(
+                qo_indptr_tensor[:-1],
+                seq_lens_tensor
+            )
+            positions = positions - q_offsets
         else:
+            qo_indptr_tensor = None
             batch_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
             positions = seq_lens_tensor - 1
         
