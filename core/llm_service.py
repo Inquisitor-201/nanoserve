@@ -49,7 +49,7 @@ class LLMService:
         model_path: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
         **kwargs
-    ) -> str:
+    ):
         """
         Load Qwen3 model with specified configuration.
         
@@ -100,24 +100,9 @@ class LLMService:
                 "block_size": 16,
             }
         else:
-            # Use default configuration
-            logger.info("Using default model configuration")
-            model_config = {
-                "model_name": "qwen3",
-                "vocab_size": 32000,
-                "hidden_size": 4096,
-                "num_heads": 32,
-                "num_key_value_heads": 32,
-                "head_dim": 128,
-                "intermediate_size": 11008,
-                "num_layers": 32,
-                "attention_backend": "flashinfer",
-                "dtype": torch.float16,
-                "device": self.device,
-                "num_blocks": 1000,
-                "block_size": 16,
-            }
-        
+            # Raise exception
+            raise ValueError("model_path must be provided when loading from HuggingFace model")
+
         # Merge configurations (user config overrides defaults)
         final_config = {**model_config, **(config or {}), **kwargs}
         
@@ -132,7 +117,6 @@ class LLMService:
         self.block_manager = self.model_executor.block_manager
         
         logger.info("Successfully loaded Qwen3 model")
-        return final_config["model_name"]
     
     def generate(
         self,

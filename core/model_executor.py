@@ -64,6 +64,7 @@ class ModelExecutor:
         self.model_name = model_name
         self.device = device
         self.dtype = dtype
+        self.block_size = block_size
         
         # Initialize block manager for KV cache management
         self.block_manager = BlockManager(
@@ -123,6 +124,7 @@ class ModelExecutor:
             block_tables=block_tables,
             seq_lengths=seq_lengths,
             is_prefill=True,
+            page_size=self.block_size,
             device=self.device
         )
         

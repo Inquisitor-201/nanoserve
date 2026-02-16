@@ -97,6 +97,7 @@ class TestGQA(unittest.TestCase):
             block_tables=[[0]], 
             seq_lengths=[seq_len],
             is_prefill=True,
+            page_size=16,
             device=self.device
         )
 

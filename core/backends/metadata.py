@@ -83,52 +83,41 @@ class AttentionMetadata:
         cls,
         block_tables: List[List[int]],
         seq_lengths: List[int],
+        page_size: int,
         is_prefill: bool = True,
         causal: bool = True,
         device: Union[str, torch.device] = "cuda"
     ) -> "AttentionMetadata":
         """
         Create metadata from block tables and sequence lengths.
-        
+
         Args:
             block_tables: List of block tables for each sequence
             seq_lengths: List of sequence lengths
             is_prefill: Whether this is prefill operation
             causal: Whether to use causal mask
             device: Device for tensor creation
-            
+            page_size: Page size for block management
+
         Returns:
             AttentionMetadata instance
         """
-        # Convert block tables to FlashInfer format
+        seq_lens_tensor = torch.tensor(seq_lengths, dtype=torch.int32, device=device)
+        num_pages = (seq_lens_tensor + page_size - 1) // page_size
+
         flat_indices = []
         indptr = [0]
-        last_page_len = []
-        
-        for i, (block_table, seq_len) in enumerate(zip(block_tables, seq_lengths)):
-            # Calculate number of pages needed
-            page_size = 16  # This should match the backend configuration
-            num_pages = (seq_len + page_size - 1) // page_size
-            
-            # Add block indices for this sequence
-            flat_indices.extend(block_table[:num_pages])
+        for block_table, num_pg in zip(block_tables, num_pages.tolist()):
+            flat_indices.extend(block_table[:num_pg])
             indptr.append(len(flat_indices))
-            
-            # Calculate last page length
-            remainder = seq_len % page_size
-            if remainder == 0:
-                last_page_len.append(page_size)
-            else:
-                last_page_len.append(remainder)
-        
-        # Convert to tensors
+
+        last_page_len = ((seq_lens_tensor - 1) % page_size + 1).to(dtype=torch.int32)
+
         paged_kv_indices = torch.tensor(flat_indices, dtype=torch.int32, device=device)
         paged_kv_indptr = torch.tensor(indptr, dtype=torch.int32, device=device)
-        paged_kv_last_page_len = torch.tensor(last_page_len, dtype=torch.int32, device=device)
+        paged_kv_last_page_len = last_page_len
 
-        # Build geometric metadata for FlashInfer operators
         batch_size = len(seq_lengths)
-        seq_lens_tensor = torch.tensor(seq_lengths, dtype=torch.int32, device=device)
 
         if is_prefill:
             qo_indptr_tensor = torch.cat([
