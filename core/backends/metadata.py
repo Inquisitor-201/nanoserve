@@ -128,35 +128,35 @@ class AttentionMetadata:
         
         # Build qo_indptr from sequence lengths
         if is_prefill:
-            # Build qo_indptr for prefill from seq_lengths
-            qo_indptr = [0]
-            current_pos = 0
-            for seq_len in seq_lengths:
-                current_pos += seq_len
-                qo_indptr.append(current_pos)
-            qo_indptr_tensor = torch.tensor(qo_indptr, dtype=torch.int32, device=device)
+            seq_lengths_tensor = torch.tensor(seq_lengths, dtype=torch.int32, device=device)
+            qo_indptr_tensor = torch.cat([
+                torch.zeros(1, dtype=torch.int32, device=device),
+                torch.cumsum(seq_lengths_tensor, dim=0)
+            ])
         else:
             qo_indptr_tensor = None
         
         # Generate geometric metadata for FlashInfer operators
         batch_size = len(seq_lengths)
+        seq_lens_tensor = torch.tensor(seq_lengths, dtype=torch.int32, device=device)
         if is_prefill:
-            # Prefill: Generate batch_indices and positions from sequence lengths
-            # batch_indices: Each token mapped to its sequence index using repeat_interleave
-            batch_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-            batch_indices = batch_indices.repeat_interleave(
-                torch.tensor(seq_lengths, dtype=torch.int32, device=device)
+            # Prefill: 
+            batch_indices = torch.repeat_interleave(
+                torch.arange(batch_size, dtype=torch.int32, device=device),
+                seq_lens_tensor
             )
-            
-            # positions: Relative position within each sequence [0,1,2,...,len-1, 0,1,2,...,len-1, ...]
-            positions_list = []
-            for seq_len in seq_lengths:
-                positions_list.append(torch.arange(seq_len, dtype=torch.int32, device=device))
-            positions = torch.cat(positions_list)
+
+            total_tokens = seq_lens_tensor.sum().item()
+            q_positions = torch.arange(total_tokens, dtype=torch.int32, device=device)
+            q_indptr = torch.cat([
+                torch.tensor([0], dtype=torch.int32, device=device),
+                torch.cumsum(seq_lens_tensor, dim=0)[:-1]
+            ])
+            q_offsets = torch.repeat_interleave(q_indptr, seq_lens_tensor)
+            positions = q_positions - q_offsets
         else:
-            # Decode: batch_indices is just sequence indices, positions are current lengths
             batch_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-            positions = torch.tensor(seq_lengths, dtype=torch.int32, device=device)
+            positions = seq_lens_tensor - 1
         
         return cls(
             block_tables=block_tables,
