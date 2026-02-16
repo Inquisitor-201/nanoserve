@@ -113,12 +113,18 @@ class ModelExecutor:
         
         Args:
             input_ids: Input token IDs
-            block_tables: Block tables for each sequence
+            block_tables: Block tables for each sequence (if empty, blocks will be auto-allocated)
             seq_lengths: Sequence lengths
             
         Returns:
             Hidden states after prefill
         """
+        # Auto-allocate blocks if not provided
+        if not block_tables or all(len(bt) == 0 for bt in block_tables):
+            total_tokens = sum(seq_lengths)
+            allocated_blocks = self.block_manager.allocate_blocks(total_tokens)
+            block_tables = [allocated_blocks]
+        
         # Create attention metadata for prefill
         metadata = AttentionMetadata.from_block_tables(
             block_tables=block_tables,
