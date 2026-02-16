@@ -25,9 +25,9 @@ class TestGQA(unittest.TestCase):
         # Format: [num_layers, num_blocks, 2, block_size, num_heads, head_dim]
         num_layers = 1
         num_blocks = 1
-        block_size = 16
+        self.block_size = 16
         self.kv_cache_pool = torch.randn(
-            (num_layers, num_blocks, 2, block_size, self.num_kv_heads, self.head_dim),
+            (num_layers, num_blocks, 2, self.block_size, self.num_kv_heads, self.head_dim),
             dtype=self.dtype,
             device=self.device
         )
@@ -66,6 +66,7 @@ class TestGQA(unittest.TestCase):
             block_tables=[[0]], # Dummy block 0
             seq_lengths=[seq_len],
             is_prefill=True,
+            page_size=self.block_size,
             device=self.device
         )
 
@@ -97,7 +98,7 @@ class TestGQA(unittest.TestCase):
             block_tables=[[0]], 
             seq_lengths=[seq_len],
             is_prefill=True,
-            page_size=16,
+            page_size=self.block_size,
             device=self.device
         )
 
