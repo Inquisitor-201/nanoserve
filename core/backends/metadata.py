@@ -31,6 +31,12 @@ class AttentionMetadata:
     # Query/Output indptr (for prefill)
     qo_indptr: Optional[torch.Tensor] = None
     
+    # Geometric metadata for FlashInfer operators
+    # batch_indices: Maps each token to its batch sequence index
+    # positions: Relative position within each sequence
+    batch_indices: Optional[torch.Tensor] = None
+    positions: Optional[torch.Tensor] = None
+    
     # Operation type flags
     is_prefill: bool = True
     causal: bool = True
@@ -52,6 +58,25 @@ class AttentionMetadata:
                 
             if self.block_tables is not None and len(self.seq_lengths) != self.batch_size:
                 raise ValueError(f"seq_lengths length {len(self.seq_lengths)} != batch_size {self.batch_size}")
+    
+    def __repr__(self) -> str:
+        """Custom repr that avoids printing CUDA tensors directly."""
+        fields = {
+            "block_tables": self.block_tables,
+            "seq_lengths": self.seq_lengths,
+            "paged_kv_indptr": f"tensor(shape={self.paged_kv_indptr.shape})" if self.paged_kv_indptr is not None else None,
+            "paged_kv_indices": f"tensor(shape={self.paged_kv_indices.shape})" if self.paged_kv_indices is not None else None,
+            "paged_kv_last_page_len": f"tensor(shape={self.paged_kv_last_page_len.shape})" if self.paged_kv_last_page_len is not None else None,
+            "qo_indptr": f"tensor(shape={self.qo_indptr.shape})" if self.qo_indptr is not None else None,
+            "batch_indices": f"tensor(shape={self.batch_indices.shape})" if self.batch_indices is not None else None,
+            "positions": f"tensor(shape={self.positions.shape})" if self.positions is not None else None,
+            "is_prefill": self.is_prefill,
+            "causal": self.causal,
+            "batch_size": self.batch_size,
+            "max_seq_len": self.max_seq_len,
+            "num_tokens": self.num_tokens,
+        }
+        return f"AttentionMetadata({fields})"
     
     @classmethod
     def from_block_tables(
@@ -117,6 +142,30 @@ class AttentionMetadata:
         else:
             qo_indptr_tensor = None
         
+        # Generate geometric metadata for FlashInfer operators
+        batch_size = len(seq_lengths)
+        if is_prefill and qo_indptr_tensor is not None:
+            # Prefill: Generate batch_indices and positions from sequence lengths
+            # batch_indices: Each token mapped to its sequence index using repeat_interleave
+            batch_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
+            batch_indices = batch_indices.repeat_interleave(
+                torch.tensor(seq_lengths, dtype=torch.int32, device=device)
+            )
+            
+            # positions: Relative position within each sequence [0,1,2,...,len-1, 0,1,2,...,len-1, ...]
+            positions_list = []
+            for seq_len in seq_lengths:
+                positions_list.append(torch.arange(seq_len, dtype=torch.int32, device=device))
+            positions = torch.cat(positions_list)
+        elif not is_prefill:
+            # Decode: batch_indices is just sequence indices, positions are current lengths
+            batch_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
+            positions = torch.tensor(seq_lengths, dtype=torch.int32, device=device)
+        else:
+            # Fallback for prefill without qo_indptr
+            batch_indices = None
+            positions = None
+        
         return cls(
             block_tables=block_tables,
             seq_lengths=seq_lengths,
@@ -124,6 +173,8 @@ class AttentionMetadata:
             paged_kv_indices=paged_kv_indices,
             paged_kv_last_page_len=paged_kv_last_page_len,
             qo_indptr=qo_indptr_tensor,
+            batch_indices=batch_indices,
+            positions=positions,
             is_prefill=is_prefill,
             causal=causal,
         )
@@ -142,5 +193,9 @@ class AttentionMetadata:
             self.paged_kv_last_page_len = self.paged_kv_last_page_len.to(device)
         if self.qo_indptr is not None:
             self.qo_indptr = self.qo_indptr.to(device)
+        if self.batch_indices is not None:
+            self.batch_indices = self.batch_indices.to(device)
+        if self.positions is not None:
+            self.positions = self.positions.to(device)
             
         return self

@@ -162,27 +162,27 @@ class FlashInferBackend:
         
         kv_cache_layer = self.kv_cache_pool[layer_idx]
         
-        total_tokens = key_states.shape[0]
-        device = key_states.device
+        if metadata.batch_indices is None or metadata.positions is None:
+            raise ValueError("batch_indices and positions are required in metadata for attention computation")
         
-        batch_indices = torch.zeros(total_tokens, dtype=torch.int32, device=device)
-        positions = torch.arange(total_tokens, dtype=torch.int32, device=device)
-        
+        batch_indices = metadata.batch_indices
+        positions = metadata.positions
+
         flashinfer.append_paged_kv_cache(
-            key_states,
-            value_states,
-            batch_indices,
-            positions,
-            kv_cache_layer,
-            metadata.paged_kv_indices,
-            metadata.paged_kv_indptr,
-            metadata.paged_kv_last_page_len,
+            append_key=key_states,
+            append_value=value_states,
+            batch_indices=batch_indices,
+            positions=positions,
+            paged_kv_cache=kv_cache_layer,
+            kv_indices=metadata.paged_kv_indices,
+            kv_indptr=metadata.paged_kv_indptr,
+            kv_last_page_len=metadata.paged_kv_last_page_len,
             kv_layout="NHD"
         )
-        
         output = torch.empty_like(query)
-        
+
         if self._current_metadata.is_prefill:
+            assert query.shape[0] == metadata.qo_indptr[-1], f"Query tokens {query.shape[0]} mismatch with indptr {metadata.qo_indptr[-1]}"
             output = self.prefill_wrapper.run(
                 q=query,
                 paged_kv_cache=kv_cache_layer,
@@ -191,8 +191,8 @@ class FlashInferBackend:
         else:
             output = self.decode_wrapper.run(
                 q=query,
-                kv_cache_layer=kv_cache_layer,
-                output=output
+                paged_kv_cache=kv_cache_layer,
+                out=output
             )
         
         return output
