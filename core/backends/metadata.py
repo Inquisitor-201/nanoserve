@@ -154,24 +154,3 @@ class AttentionMetadata:
             is_prefill=is_prefill,
             causal=causal,
         )
-    
-    def to_device(self, device: Union[str, torch.device]) -> "AttentionMetadata":
-        """Move tensor metadata to specified device."""
-        if isinstance(device, str):
-            device = torch.device(device)
-            
-        # Move tensors to device
-        if self.paged_kv_indptr is not None:
-            self.paged_kv_indptr = self.paged_kv_indptr.to(device)
-        if self.paged_kv_indices is not None:
-            self.paged_kv_indices = self.paged_kv_indices.to(device)
-        if self.paged_kv_last_page_len is not None:
-            self.paged_kv_last_page_len = self.paged_kv_last_page_len.to(device)
-        if self.qo_indptr is not None:
-            self.qo_indptr = self.qo_indptr.to(device)
-        if self.batch_indices is not None:
-            self.batch_indices = self.batch_indices.to(device)
-        if self.positions is not None:
-            self.positions = self.positions.to(device)
-            
-        return self
