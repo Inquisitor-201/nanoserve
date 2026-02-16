@@ -85,8 +85,7 @@ class AttentionMetadata:
         seq_lengths: List[int],
         is_prefill: bool = True,
         causal: bool = True,
-        device: Union[str, torch.device] = "cuda",
-        qo_indptr: Optional[torch.Tensor] = None
+        device: Union[str, torch.device] = "cuda"
     ) -> "AttentionMetadata":
         """
         Create metadata from block tables and sequence lengths.
@@ -127,12 +126,9 @@ class AttentionMetadata:
         paged_kv_indptr = torch.tensor(indptr, dtype=torch.int32, device=device)
         paged_kv_last_page_len = torch.tensor(last_page_len, dtype=torch.int32, device=device)
         
-        # Use provided qo_indptr or build it from sequence lengths
-        if qo_indptr is not None:
-            # Use provided qo_indptr (from unpadding logic)
-            qo_indptr_tensor = qo_indptr
-        elif is_prefill:
-            # Build qo_indptr for prefill if not provided
+        # Build qo_indptr from sequence lengths
+        if is_prefill:
+            # Build qo_indptr for prefill from seq_lengths
             qo_indptr = [0]
             current_pos = 0
             for seq_len in seq_lengths:
@@ -144,7 +140,7 @@ class AttentionMetadata:
         
         # Generate geometric metadata for FlashInfer operators
         batch_size = len(seq_lengths)
-        if is_prefill and qo_indptr_tensor is not None:
+        if is_prefill:
             # Prefill: Generate batch_indices and positions from sequence lengths
             # batch_indices: Each token mapped to its sequence index using repeat_interleave
             batch_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
@@ -157,14 +153,10 @@ class AttentionMetadata:
             for seq_len in seq_lengths:
                 positions_list.append(torch.arange(seq_len, dtype=torch.int32, device=device))
             positions = torch.cat(positions_list)
-        elif not is_prefill:
+        else:
             # Decode: batch_indices is just sequence indices, positions are current lengths
             batch_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
             positions = torch.tensor(seq_lengths, dtype=torch.int32, device=device)
-        else:
-            # Fallback for prefill without qo_indptr
-            batch_indices = None
-            positions = None
         
         return cls(
             block_tables=block_tables,
