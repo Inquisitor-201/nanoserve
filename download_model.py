@@ -17,7 +17,7 @@ def download_qwen3_model():
     
     try:
         # Create models directory
-        models_dir = "/root/nanoserve/models/Qwen3-0.6B"
+        models_dir = "./models/Qwen3-0.6B"
         os.makedirs(models_dir, exist_ok=True)
         
         print(f"📦 Downloading Qwen/Qwen3-0.6B to {models_dir}")

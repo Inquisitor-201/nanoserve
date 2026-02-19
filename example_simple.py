@@ -30,24 +30,25 @@ def main():
         
         # Load with optimized configuration for the real model
         real_config = {
-            "dtype": torch.float16,    # 使用float16减少内存使用
+            "dtype": torch.bfloat16,    # 使用bfloat16以获得更好的数值稳定性
             "num_blocks": 200,         # 为真实模型提供更多KV缓存块
             "block_size": 16,          # 保持block_size不变
             "attention_backend": "flashinfer", # 使用flashinfer后端
         }
-        
+
         llm_service.load_model(model_path=model_path, config=real_config)
         print("✅ Model loaded successfully")
         
         # Simple text generation
         print("\n📝 Generating text...")
-        prompts = ["Hello, world!", "Please tell me, the future of AI is"]
+        prompts = ["中国是一个", 
+                   "你是一个精通逻辑推理的数学助手。在回答任何数学问题之前，你必须遵循以下步骤：1. 提取题目中的关键数字和条件；2. 分步骤列出计算过程，每一步只做一个简单的运算；3. 最后给出最终结果。请务必保持逻辑严密，不要跳步。请你计算：小红买了3个苹果，单价12元；又买了2个梨，单价16元。她给了老板68元，应该找回多少钱？"]
         
         print(f"Input: {prompts}")
         generated_texts = llm_service.generate(
             prompts=prompts,
-            max_new_tokens=20,
-            temperature=0.7
+            max_new_tokens=400,  # Increased to test dynamic block allocation
+            temperature=0.0
         )
         
         print(f"\n✅ Generated text:")

@@ -2,12 +2,13 @@ import os
 import sys
 import unittest
 import torch
+import flashinfer
 
 # Add project root to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from core.backends.metadata import AttentionMetadata
-from core.layers.attention import Attention
+from core.model_specific.qwen3.attention import Qwen3Attention
 from core.backends.flashinfer_backend import FlashInferBackend
 
 torch.manual_seed(42)
@@ -43,13 +44,14 @@ class TestGQA(unittest.TestCase):
         )
         
         # 2. Initialize Attention Layer
-        self.attention = Attention(
+        self.attention = Qwen3Attention(
             hidden_size=self.hidden_size,
             num_heads=self.num_heads,
             head_dim=self.head_dim,
             num_key_value_heads=self.num_kv_heads,
-            backend=self.backend,
+            attention_backend=self.backend,
             layer_idx=0,
+            rope_theta=1000000.0,
             device=self.device,
             dtype=self.dtype
         )
@@ -104,15 +106,27 @@ class TestGQA(unittest.TestCase):
 
         # Record weight-based K, V for manual verification
         with torch.inference_mode():
-            # Manually compute what K should be
-            expected_k = self.attention.k_norm(self.attention.k_proj(hidden_states).view(seq_len, self.num_kv_heads, self.head_dim))
-            
+            # Manually compute what K should be (including RoPE)
+            k = self.attention.k_proj(hidden_states).view(seq_len, self.num_kv_heads, self.head_dim)
+            expected_k = self.attention.k_norm(k)
+            # Apply RoPE to match what's stored in cache
+            q = self.attention.q_proj(hidden_states).view(seq_len, self.attention.num_heads, self.attention.head_dim)
+            q = self.attention.q_norm(q)
+            # Apply RoPE to both q and k
+            flashinfer.rope.apply_rope_pos_ids_inplace(
+                q,
+                expected_k,
+                pos_ids=metadata.positions,
+                rotary_dim=None,
+                interleave=False,
+                rope_scale=1.0,
+                rope_theta=self.attention.rope_theta
+            )
             # Run the forward pass
             self.attention.forward(hidden_states, metadata)
-            
             # ASSERTION: The backend MUST have a way to store these.
-            # If your FlashInferBackend currently has no 'kv_cache' attribute, 
-            # this test will fail, forcing the Agent to implement the storage logic.
+            # If your FlashInferBackend currently has no 'kv_cache' attribute
+            # this test will fail forcing the Agent to implement the storage logic.
             if hasattr(self.backend, 'kv_cache_pool') and self.backend.kv_cache_pool is not None:
                 # Check if the values in cache match the projected K
                 # We check the first few elements of the first block

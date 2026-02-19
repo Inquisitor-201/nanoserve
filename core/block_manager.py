@@ -32,7 +32,7 @@ class BlockManager:
         num_key_value_heads: int,
         head_dim: int,
         block_size: int,
-        dtype: torch.dtype = torch.float16,
+        dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda"
     ):
         """

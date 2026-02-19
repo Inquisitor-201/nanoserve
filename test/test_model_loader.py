@@ -65,36 +65,36 @@ class TestModelLoading(unittest.TestCase):
         mismatched_keys = []
         checked_count = 0
         
-    #     # Check EVERY weight in safetensors, not just a subset
-    #     for hf_key, ref_tensor in self.ref_weights.items():
-    #         mapped_key = ModelLoader._map_weight_name(hf_key)
+        # Check EVERY weight in safetensors, not just a subset
+        for hf_key, ref_tensor in self.ref_weights.items():
+            mapped_key = ModelLoader._map_weight_name(hf_key)
             
-    #         if mapped_key in model_state:
-    #             checked_count += 1
-    #             model_tensor = model_state[mapped_key].cpu()
-    #             ref_tensor_comp = ref_tensor.to(dtype=self.config["dtype"])
+            if mapped_key in model_state:
+                checked_count += 1
+                model_tensor = model_state[mapped_key].cpu()
+                ref_tensor_comp = ref_tensor.to(dtype=self.config["dtype"])
                 
-    #             # torch.allclose with appropriate tolerances for float16
-    #             if not torch.allclose(model_tensor, ref_tensor_comp, atol=1e-3, rtol=1e-3):
-    #                 mismatched_keys.append({
-    #                     "hf_key": hf_key,
-    #                     "mapped_key": mapped_key,
-    #                     "max_diff": (model_tensor - ref_tensor_comp).abs().max().item()
-    #                 })
+                # torch.allclose with appropriate tolerances for float16
+                if not torch.allclose(model_tensor, ref_tensor_comp, atol=1e-3, rtol=1e-3):
+                    mismatched_keys.append({
+                        "hf_key": hf_key,
+                        "mapped_key": mapped_key,
+                        "max_diff": (model_tensor - ref_tensor_comp).abs().max().item()
+                    })
         
-    #     # Report results
-    #     if mismatched_keys:
-    #         first_mismatch = mismatched_keys[0]
-    #         self.fail(
-    #             f"Weight mismatch detected!\n"
-    #             f"Checked {checked_count}/{len(self.ref_weights)} weights from safetensors.\n"
-    #             f"First mismatch: {first_mismatch['hf_key']} -> {first_mismatch['mapped_key']}\n"
-    #             f"Max diff: {first_mismatch['max_diff']:.6f}"
-    #         )
-    #     else:
-    #         self.assertEqual(checked_count, len(self.ref_weights), 
-    #                        f"Not all weights were checked: {checked_count} vs {len(self.ref_weights)}")
-    #         print(f"[OK] All {checked_count} weights from safetensors match exactly.")
+        # Report results
+        if mismatched_keys:
+            first_mismatch = mismatched_keys[0]
+            self.fail(
+                f"Weight mismatch detected!\n"
+                f"Checked {checked_count}/{len(self.ref_weights)} weights from safetensors.\n"
+                f"First mismatch: {first_mismatch['hf_key']} -> {first_mismatch['mapped_key']}\n"
+                f"Max diff: {first_mismatch['max_diff']:.6f}"
+            )
+        else:
+            self.assertEqual(checked_count, len(self.ref_weights), 
+                           f"Not all weights were checked: {checked_count} vs {len(self.ref_weights)}")
+            print(f"[OK] All {checked_count} weights from safetensors match exactly.")
 
     def test_03_weight_values_fingerprint(self):
         """Verify weights are not zero or random by checking statistical fingerprint."""
@@ -111,11 +111,17 @@ class TestModelLoading(unittest.TestCase):
 
     def test_04_inference_stability(self):
         """Run a dummy prefill and check if logits are within reasonable bounds."""
-        input_ids = torch.tensor([151644, 8948, 198], device="cuda")
+        input_ids = torch.tensor([151644, 8948, 198], device="cuda", dtype=torch.long)
+        seq_length = len(input_ids)
+        
+        # Allocate blocks before calling execute_prefill
+        block_manager = self.executor.block_manager
+        allocated_blocks = block_manager.allocate_blocks(seq_length)
+        block_tables = [allocated_blocks]
+        
         with torch.inference_mode():
-            # Ensure the executor uses the weights we just verified
-            hidden_states = self.executor.execute_prefill(input_ids, [[]], [len(input_ids)])
-            logits = self.executor.model.lm_head(hidden_states)
+            # execute_prefill returns logits directly
+            logits = self.executor.execute_prefill(input_ids, block_tables, [seq_length])
         
         max_logit = logits.max().item()
         self.assertTrue(abs(max_logit) < 25.0, f"Exploding/Imploding logits detected: {max_logit}")

@@ -31,7 +31,7 @@ class FlashInferBackend:
         kv_cache_pool: torch.Tensor,
         num_key_value_heads: Optional[int] = None,
         page_size: int = 16,
-        dtype: torch.dtype = torch.float16,
+        dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
         workspace_size_mb: int = 128
     ):
@@ -76,7 +76,6 @@ class FlashInferBackend:
         )
         
         self._current_metadata: Optional[AttentionMetadata] = None
-        self._is_planned = False
         
         logger.info(f"Initialized FlashInferBackend: num_heads={num_heads}, num_key_value_heads={self.num_key_value_heads}, "
                    f"head_dim={head_dim}, page_size={page_size}, num_key_value_groups={self.num_key_value_groups}")
@@ -97,7 +96,6 @@ class FlashInferBackend:
             self._plan_decode(metadata)
         
         self._current_metadata = metadata
-        self._is_planned = True
         logger.debug(f"Planned attention: is_prefill={metadata.is_prefill}, batch_size={metadata.batch_size}")
     
     def _plan_prefill(self, metadata: AttentionMetadata) -> None:
@@ -117,6 +115,7 @@ class FlashInferBackend:
             causal=metadata.causal,
             q_data_type=self.dtype,
             kv_data_type=self.dtype,
+            pos_encoding_mode="NONE",
         )
     
     def _plan_decode(self, metadata: AttentionMetadata) -> None:
@@ -129,7 +128,9 @@ class FlashInferBackend:
             self.num_key_value_heads,
             self.head_dim,
             self.page_size,
-            data_type=self.dtype,
+            q_data_type=self.dtype,
+            kv_data_type=self.dtype,
+            pos_encoding_mode="NONE",
         )
     
     def run(
@@ -155,52 +156,42 @@ class FlashInferBackend:
         Returns:
             Attention output tensor [total_tokens, num_heads, head_dim]
         """
+        # Check if we need to replan due to metadata change or first run or dtype mismatch
         if metadata is not None and metadata != self._current_metadata:
             self.plan(metadata)
-        elif not self._is_planned:
-            raise RuntimeError("Must call plan() before run()")
         
         kv_cache_layer = self.kv_cache_pool[layer_idx]
-        
-        if metadata.batch_indices is None or metadata.positions is None:
-            raise ValueError("batch_indices and positions are required in metadata for attention computation")
-        
-        batch_indices = metadata.batch_indices
-        positions = metadata.positions
 
         flashinfer.append_paged_kv_cache(
             append_key=key_states,
             append_value=value_states,
-            batch_indices=batch_indices,
-            positions=positions,
+            batch_indices=metadata.batch_indices,
+            positions=metadata.positions,
             paged_kv_cache=kv_cache_layer,
             kv_indices=metadata.paged_kv_indices,
             kv_indptr=metadata.paged_kv_indptr,
             kv_last_page_len=metadata.paged_kv_last_page_len,
             kv_layout="NHD"
         )
-        output = torch.empty_like(query)
 
-        if self._current_metadata.is_prefill:
+        # Use the current metadata's is_prefill flag, not the cached one
+        if metadata.is_prefill:
             assert query.shape[0] == metadata.qo_indptr[-1], f"Query tokens {query.shape[0]} mismatch with indptr {metadata.qo_indptr[-1]}"
             output = self.prefill_wrapper.run(
                 q=query,
                 paged_kv_cache=kv_cache_layer,
-                out=output
             )
         else:
             output = self.decode_wrapper.run(
                 q=query,
                 paged_kv_cache=kv_cache_layer,
-                out=output
             )
         
         return output
     
-    def reset_plan_state(self) -> None:
-        """Reset the plan state for new batch."""
+    def reset_state(self) -> None:
+        """Reset all internal states for new batch."""
         self._current_metadata = None
-        self._is_planned = False
     
     def __repr__(self) -> str:
         return (f"FlashInferBackend(num_heads={self.num_heads}, head_dim={self.head_dim}, "

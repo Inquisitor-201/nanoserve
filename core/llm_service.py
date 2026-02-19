@@ -94,7 +94,7 @@ class LLMService:
                 "intermediate_size": hf_config.intermediate_size,
                 "num_layers": hf_config.num_hidden_layers,
                 "attention_backend": "flashinfer",
-                "dtype": torch.float16,  # Use float16 for compatibility
+                "dtype": torch.bfloat16,  # Use float16 for compatibility
                 "device": self.device,
                 "num_blocks": 1000,
                 "block_size": 16,
@@ -141,68 +141,45 @@ class LLMService:
         if self.model_executor is None:
             raise RuntimeError("No model loaded. Call load_model() first.")
         
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer not loaded. Call load_model() first.")
+
         # Convert single prompt to list
         if isinstance(prompts, str):
             prompts = [prompts]
         
-        # Use real tokenizer if available
-        if self.tokenizer is not None:
-            # Tokenize prompts
-            encoded = self.tokenizer(
-                prompts,
-                padding=True,
-                truncation=True,
-                return_tensors="pt"
-            )
-            input_ids = encoded["input_ids"].to(self.device)
-            attention_mask = encoded["attention_mask"].to(self.device)
+        encoded = self.tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            return_tensors="pt"
+        )
+        input_ids = encoded["input_ids"].to(self.device)
+        attention_mask = encoded["attention_mask"].to(self.device)
             
-            batch_size, max_seq_len = input_ids.shape
-            seq_lengths = attention_mask.sum(dim=1).tolist()
+        batch_size, max_seq_len = input_ids.shape
+        seq_lengths = attention_mask.sum(dim=1).tolist()
             
-            # UNPADDING: Remove padding tokens to create compact 1D tensor
-            # This is critical for FlashInfer Paged KV Cache to avoid wasting memory
-            flattened_input_ids = input_ids[attention_mask.bool()].contiguous()
+        # UNPADDING: Remove padding tokens to create compact 1D tensor
+        # This is critical for FlashInfer Paged KV Cache to avoid wasting memory
+        flattened_input_ids = input_ids[attention_mask.bool()].contiguous()
             
-            # Build qo_indptr for FlashInfer to identify sequence boundaries
-            qo_indptr = [0]
-            for seq_len in seq_lengths:
-                qo_indptr.append(qo_indptr[-1] + seq_len)
-            qo_indptr_tensor = torch.tensor(qo_indptr, dtype=torch.int32, device=self.device)
-            
-            logger.info(f"Unpadding: batch_size={batch_size}, max_seq_len={max_seq_len}, total_tokens={flattened_input_ids.shape[0]}")
-            logger.info(f"qo_indptr: {qo_indptr}")
-            
-        else:
-            # Fallback to placeholder tokenization
-            logger.warning("No tokenizer available, using placeholder tokenization")
-            batch_size = len(prompts)
-            seq_lengths = [len(prompt) for prompt in prompts]
-            max_seq_len = max(seq_lengths)
-            
-            # Create random input IDs as placeholder (no padding needed)
-            vocab_size = self.model_executor.model.vocab_size if self.model_executor else 32000
-            flattened_input_ids = torch.randint(
-                0, vocab_size,
-                (sum(seq_lengths),),  # Total tokens, no padding
-                device=self.device,
-                dtype=torch.long
-            )
-            
-            # Build qo_indptr for placeholder
-            qo_indptr = [0]
-            for seq_len in seq_lengths:
-                qo_indptr.append(qo_indptr[-1] + seq_len)
-            qo_indptr_tensor = torch.tensor(qo_indptr, dtype=torch.int32, device=self.device)
-        
-        # Create block tables for KV cache allocation
+        logger.info(f"Unpadding: batch_size={batch_size}, max_seq_len={max_seq_len}, total_tokens={flattened_input_ids.shape[0]}")
+
+        # Create initial block tables for KV cache allocation (considering max possible length)
         block_tables = []
         for seq_len in seq_lengths:
-            num_blocks = (seq_len + self.block_manager.block_size - 1) // self.block_manager.block_size
-            blocks = self.block_manager.allocate_blocks(seq_len)
+            # Calculate total sequence length including max_new_tokens
+            total_expected_length = seq_len + max_new_tokens
+            # Calculate blocks needed for the total expected length
+            blocks = self.block_manager.allocate_blocks(total_expected_length)
             if blocks is None:
-                raise RuntimeError(f"Failed to allocate {num_blocks} blocks for sequence length {seq_len}")
+                raise RuntimeError(f"Failed to allocate blocks for sequence length {seq_len} + {max_new_tokens} new tokens")
             block_tables.append(blocks)
+        
+        # Reset backend state for each new generation request to avoid cross-request contamination
+        if hasattr(self.model_executor.model, 'attention_backend') and hasattr(self.model_executor.model.attention_backend, 'reset_state'):
+            self.model_executor.model.attention_backend.reset_state()
         
         # Execute generation with unpadding
         generated_ids = self.model_executor.generate(
@@ -211,21 +188,26 @@ class LLMService:
             seq_lengths=seq_lengths,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
-            top_p=top_p,
-            qo_indptr=qo_indptr_tensor  # Pass qo_indptr for FlashInfer
+            top_p=top_p
         )
         
-        # Convert back to text using tokenizer
-        if self.tokenizer is not None:
-            # Detokenize generated IDs
-            generated_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-            # Clean up the generated text
-            generated_texts = [text.strip() for text in generated_texts]
-        else:
-            # Fallback to placeholder
-            logger.warning("No tokenizer available for decoding")
-            generated_texts = [f"Generated text for prompt: '{prompt}'" for prompt in prompts]
-        
+        # Reshape generated_ids to [batch_size, max_new_tokens]
+        # Original order: [seq0_tok1, seq1_tok1, seq0_tok2, seq1_tok2, ...]
+        # Need to convert to: [seq0_tok1, seq0_tok2, ..., seq1_tok1, seq1_tok2, ...]
+        generated_ids_reshaped = generated_ids.view(max_new_tokens, batch_size).transpose(0, 1).contiguous()
+            
+        logger.info(f"Generated token IDs shape: {generated_ids_reshaped.shape}")
+        logger.info(f"Generated token IDs: {generated_ids_reshaped}")
+        # Detokenize generated IDs
+        generated_texts = []
+        for i in range(batch_size):
+            # Decode each batch individually
+            batch_generated_ids = generated_ids_reshaped[i]
+            decoded_text = self.tokenizer.decode(batch_generated_ids, skip_special_tokens=True)
+            generated_texts.append(decoded_text)
+            
+        logger.info(f"Decoded texts: {generated_texts}")
+
         return generated_texts
     
     def execute_prefill(

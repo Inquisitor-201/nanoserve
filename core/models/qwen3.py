@@ -1,120 +1,34 @@
 """
-Qwen3 model implementation demonstrating the decoupled architecture.
-Shows how to use FlashInferBackend with the attention layer.
+Qwen3 model implementation using the decoupled architecture.
+
+This module demonstrates the clean separation between:
+- Generic layers (layers.py): RMSNorm, Embedding, Linear
+- Model-specific implementations (model_specific/qwen3/): Qwen3Attention, Qwen3MLP
+- Backend (backends/): FlashInfer for efficient attention computation
 """
 
-from typing import Optional, List
+from typing import Optional, List, Tuple
 import torch
 import torch.nn as nn
 
-from ..layers import Attention, MLP
-from ..backends import AttentionMetadata, FlashInferBackend
-
-
-class Qwen3DecoderLayer(nn.Module):
-    """
-    Qwen3 decoder layer with decoupled attention backend.
-    
-    This layer demonstrates the clean separation between model logic
-    and attention computation backend.
-    """
-    
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        head_dim: int,
-        intermediate_size: int,
-        attention_backend,
-        layer_idx: int,
-        num_key_value_heads: Optional[int] = None,
-        rms_norm_eps: float = 1e-6,
-        device: Optional[str] = None,
-        dtype: Optional[torch.dtype] = None
-    ):
-        """
-        Initialize Qwen3 decoder layer with GQA support.
-        
-        Args:
-            hidden_size: Hidden size of the model
-            num_heads: Number of attention heads (Query heads)
-            head_dim: Dimension of each attention head
-            intermediate_size: Intermediate size for MLP
-            attention_backend: Attention backend instance
-            layer_idx: Layer index
-            num_key_value_heads: Number of key/value heads (for GQA). If None, defaults to num_heads
-            rms_norm_eps: RMS norm epsilon
-            device: Computing device
-            dtype: Data type
-        """
-        super().__init__()
-        
-        self.hidden_size = hidden_size
-        self.layer_idx = layer_idx
-        
-        # Self-attention with pluggable backend and GQA support
-        self.self_attn = Attention(
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            num_key_value_heads=num_key_value_heads,
-            backend=attention_backend,
-            layer_idx=layer_idx,
-            bias=False,
-            device=device,
-            dtype=dtype
-        )
-        
-        # MLP
-        self.mlp = MLP(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            bias=False,
-            device=device,
-            dtype=dtype
-        )
-        
-        # Layer normalization
-        self.input_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
-        self.post_attention_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
-    
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        metadata: AttentionMetadata
-    ) -> torch.Tensor:
-        """
-        Forward pass of decoder layer.
-        
-        Args:
-            hidden_states: Input hidden states (flattened 2D tensor for unpadding)
-            metadata: Attention metadata
-            
-        Returns:
-            Output hidden states
-        """
-        # Self-attention with residual connection
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, metadata)
-        hidden_states = residual + hidden_states
-        
-        # MLP with residual connection
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        
-        return hidden_states
+from ..layers_utils import Embedding
+from ..backends import AttentionMetadata, FlashInferBackend, TorchBackend
+from ..model_specific.qwen3.attention import Qwen3DecoderLayer
 
 
 class Qwen3Model(nn.Module):
     """
     Qwen3 model with decoupled architecture.
     
-    This model demonstrates how to use the attention backend in a complete model.
-    The model is responsible for mathematical transformations, while the backend
-    handles attention computation details.
+    This model uses:
+    - Generic layers from layers.py (Embedding, RMSNorm)
+    - Model-specific attention from model_specific/qwen3/attention.py
+    - FlashInfer backend from backends/flashinfer_backend.py
+    
+    This separation allows:
+    - Clean testing of generic components
+    - Easy addition of new models with different architectures
+    - Backend swapping without changing model code
     """
     
     def __init__(
@@ -122,57 +36,73 @@ class Qwen3Model(nn.Module):
         vocab_size: int,
         hidden_size: int,
         num_heads: int,
+        num_key_value_heads: int,
         head_dim: int,
         intermediate_size: int,
         num_layers: int,
-        num_key_value_heads: Optional[int] = None,
-        rms_norm_eps: float = 1e-6,
-        attention_backend_type: str = "flashinfer",
-        device: Optional[str] = None,
-        dtype: Optional[torch.dtype] = None,
-        kv_cache_pool: Optional[torch.Tensor] = None
+        attention_backend_type: str,
+        dtype: torch.dtype,
+        device: str,
+        kv_cache_pool: torch.Tensor,
+        rope_theta: float = 1000000.0
     ):
         """
-        Initialize Qwen3 model with GQA support.
+        Initialize Qwen3 model.
         
         Args:
-            vocab_size: Vocabulary size
-            hidden_size: Hidden size of the model
-            num_heads: Number of attention heads (Query heads)
-            head_dim: Dimension of each attention head
-            intermediate_size: Intermediate size for MLP
-            num_layers: Number of decoder layers
-            num_key_value_heads: Number of key/value heads (for GQA). If None, defaults to num_heads
-            rms_norm_eps: RMS norm epsilon
-            attention_backend_type: Type of attention backend
+            vocab_size: Size of vocabulary (e.g., 151936 for Qwen3)
+            hidden_size: Hidden size (e.g., 1024 for Qwen3-0.6B)
+            num_heads: Number of attention heads (e.g., 16)
+            num_key_value_heads: Number of key/value heads for GQA (e.g., 8)
+            head_dim: Dimension of each attention head (e.g., 128)
+            intermediate_size: MLP intermediate size (e.g., 3072)
+            num_layers: Number of decoder layers (e.g., 28)
+            attention_backend_type: Type of attention backend ("flashinfer")
+            dtype: Data type for computations
             device: Computing device
-            dtype: Data type
-            kv_cache_pool: KV cache pool from BlockManager
+            kv_cache_pool: Pre-allocated KV cache pool from BlockManager
+            rope_theta: Base for RoPE rotary embeddings (default: 1M for Qwen3)
         """
         super().__init__()
         
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.num_key_value_heads = num_key_value_heads or num_heads
+        self.rope_theta = rope_theta
         
-        # Initialize attention backend - only FlashInfer supported
+        # Token embedding (generic layer)
+        self.embed_tokens = Embedding(
+            num_embeddings=vocab_size,
+            embedding_dim=hidden_size,
+            device=device,
+            dtype=dtype
+        )
+        
+        # Initialize attention backend
         if attention_backend_type == "flashinfer":
             self.attention_backend = FlashInferBackend(
                 num_heads=num_heads,
                 head_dim=head_dim,
                 kv_cache_pool=kv_cache_pool,
-                num_key_value_heads=self.num_key_value_heads,
-                device=device,
-                dtype=dtype
+                num_key_value_heads=num_key_value_heads,
+                page_size=16,
+                dtype=dtype,
+                device=device
+            )
+        elif attention_backend_type == "torch":
+            self.attention_backend = TorchBackend(
+                num_heads=num_heads,
+                head_dim=head_dim,
+                kv_cache_pool=kv_cache_pool,
+                num_key_value_heads=num_key_value_heads,
+                page_size=16,
+                dtype=dtype,
+                device=device
             )
         else:
             raise ValueError(f"Unsupported attention backend: {attention_backend_type}")
         
-        # Embedding
-        self.embed_tokens = nn.Embedding(vocab_size, hidden_size, device=device, dtype=dtype)
-        
-        # Decoder layers
+        # Decoder layers (model-specific)
         self.layers = nn.ModuleList([
             Qwen3DecoderLayer(
                 hidden_size=hidden_size,
@@ -180,20 +110,104 @@ class Qwen3Model(nn.Module):
                 head_dim=head_dim,
                 intermediate_size=intermediate_size,
                 attention_backend=self.attention_backend,
-                layer_idx=i,
-                num_key_value_heads=self.num_key_value_heads,
-                rms_norm_eps=rms_norm_eps,
+                layer_idx=layer_idx,
+                num_key_value_heads=num_key_value_heads,
+                rope_theta=rope_theta,
+                rms_norm_eps=1e-6,
+                bias=False,
                 device=device,
                 dtype=dtype
             )
-            for i in range(num_layers)
+            for layer_idx in range(num_layers)
         ])
         
-        # Final layer norm
-        self.norm = nn.RMSNorm(hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
+        # Final layer norm (generic)
+        self.norm = nn.RMSNorm(hidden_size, eps=1e-6, device=device, dtype=dtype)
         
-        # Language model head
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False, device=device, dtype=dtype)
+        # LM Head
+        self.lm_head = nn.Linear(
+            hidden_size,
+            vocab_size,
+            bias=False,
+            device=device,
+            dtype=dtype
+        )
+    
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        metadata: Optional[AttentionMetadata] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass of Qwen3 model following official Transformers structure.
+        
+        Args:
+            input_ids: Input token IDs (flattened: [total_tokens])
+            attention_mask: Attention mask (optional)
+            position_ids: Position IDs (optional)
+            past_key_values: Past KV cache (optional)
+            use_cache: Whether to return KV cache for generation
+            cache_position: Cache position tensor (optional)
+            position_embeddings: Precomputed position embeddings (optional)
+            metadata: Attention metadata for paged attention (required for our backend)
+            return_debug_info: Whether to return intermediate debug information
+            debug_layer_idx: Which layer to return debug info from (if return_debug_info=True)
+            **kwargs: Additional arguments
+            
+        Returns:
+            Logits tensor of shape [total_tokens, vocab_size], or tuple with debug info
+        """
+        # Plan attention computation once for the entire batch (if metadata provided and backend supports planning)
+        if metadata is not None and hasattr(self.attention_backend, 'plan'):
+            self.attention_backend.plan(metadata)
+        
+        # Embedding lookup
+        hidden_states = self.embed_tokens(input_ids)
+        
+        # Pass through decoder layers following official structure
+        layer_debug_info = None
+        for idx, layer in enumerate(self.layers):
+            residual = hidden_states
+            # Input layer norm
+            hidden_states = layer.input_layernorm(hidden_states)
+
+            hidden_states = layer.self_attn(hidden_states, metadata)
+
+            # Add residual connection after attention
+            hidden_states = residual + hidden_states
+
+            # Post-attention layer norm and MLP with residual connection
+            residual = hidden_states
+            hidden_states = layer.post_attention_layernorm(hidden_states)
+            hidden_states = layer.mlp(hidden_states)
+            hidden_states = residual + hidden_states
+        
+        # Final layer norm
+        hidden_states = self.norm(hidden_states)
+        
+        # LM head projection
+        logits = self.lm_head(hidden_states)
+
+        return logits
+
+
+class Qwen3ForCausalLM(nn.Module):
+    """
+    Qwen3 model for causal language modeling.
+    
+    Wraps the base model with LM head for easy generation.
+    """
+    
+    def __init__(self, model: Qwen3Model):
+        """
+        Initialize with a Qwen3Model.
+        
+        Args:
+            model: Qwen3Model instance
+        """
+        super().__init__()
+        self.model = model
+        self.lm_head = model.lm_head
     
     def forward(
         self,
@@ -201,60 +215,13 @@ class Qwen3Model(nn.Module):
         metadata: AttentionMetadata
     ) -> torch.Tensor:
         """
-        Forward pass of the model.
+        Forward pass.
         
         Args:
-            input_ids: Input token IDs (flattened 1D tensor for unpadding)
+            input_ids: Input token IDs
             metadata: Attention metadata
             
         Returns:
-            Hidden states (flattened 2D tensor)
+            Logits tensor
         """
-        # Plan attention computation once for the entire batch
-        self.attention_backend.plan(metadata)
-        
-        # Embedding - input_ids is already flattened (total_tokens,)
-        # embed_tokens expects 1D tensor and returns 2D tensor (total_tokens, hidden_size)
-        hidden_states = self.embed_tokens(input_ids)
-        
-        # Pass through decoder layers
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, metadata)
-        
-        # Final layer norm
-        hidden_states = self.norm(hidden_states)
-        
-        return hidden_states
-    
-    def generate(
-        self,
-        input_ids: torch.Tensor,
-        block_tables: List[List[int]],
-        seq_lengths: List[int],
-        max_new_tokens: int = 100,
-        temperature: float = 1.0,
-        top_p: float = 0.9,
-        qo_indptr: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        Generate tokens using the model.
-        
-        Args:
-            input_ids: Initial input token IDs (flattened, no padding)
-            block_tables: Block tables for each sequence
-            seq_lengths: Initial sequence lengths
-            max_new_tokens: Maximum number of new tokens to generate
-            temperature: Sampling temperature
-            top_p: Top-p sampling threshold
-            qo_indptr: Query/Output indices pointer for FlashInfer (required for unpadding)
-            
-        Returns:
-            Generated token IDs
-        """
-        # This is a simplified implementation for demonstration
-        # In practice, you would implement proper token-by-token generation
-        # with KV cache management
-        
-        # For now, we'll just return the input IDs as a placeholder
-        # This should be replaced with actual generation logic
-        return input_ids
+        return self.model(input_ids, metadata)

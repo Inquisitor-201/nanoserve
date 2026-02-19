@@ -123,7 +123,7 @@ class AttentionMetadata:
             qo_indptr_tensor = torch.cat([
                 torch.zeros(1, dtype=torch.int32, device=device),
                 torch.cumsum(seq_lens_tensor, dim=0)
-            ])
+            ]).to(dtype=torch.int32)
 
             batch_indices = torch.repeat_interleave(
                 torch.arange(batch_size, dtype=torch.int32, device=device),
@@ -136,11 +136,15 @@ class AttentionMetadata:
                 qo_indptr_tensor[:-1],
                 seq_lens_tensor
             )
+            # Ensure q_offsets is int32 to match positions
+            q_offsets = q_offsets.to(dtype=torch.int32)
             positions = positions - q_offsets
+            # Ensure positions remains int32
+            positions = positions.to(dtype=torch.int32)
         else:
             qo_indptr_tensor = None
             batch_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-            positions = seq_lens_tensor - 1
+            positions = (seq_lens_tensor - 1).to(dtype=torch.int32)
         
         return cls(
             block_tables=block_tables,
