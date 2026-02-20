@@ -64,44 +64,46 @@ class BlockManager:
         self._free_blocks: Deque[int] = deque(range(num_blocks))
         self._allocated_blocks = set()
         self._lock = threading.Lock()
-    
-    def allocate_blocks(self, num_tokens: int) -> List[int]:
+
+    def allocate_blocks(self, current_blocks: List[int], target_num_tokens: int) -> List[int]:
         """
-        Allocate physical blocks for given number of tokens.
+        Allocate physical blocks for a request to reach the target number of tokens.
+        If the current blocks already satisfy the target, return the current blocks.
+        Otherwise, allocate additional blocks to meet the target.
         
         Args:
-            num_tokens: Number of tokens to allocate blocks for
+            current_blocks: Current blocks allocated to the request
+            target_num_tokens: Target number of tokens the request needs to support
             
         Returns:
-            List of physical block indices
-            
-        Raises:
-            ValueError: If num_tokens is negative
-            RuntimeError: If not enough free blocks available
+            Updated list of physical block indices
         """
-        if num_tokens < 0:
-            raise ValueError(f"num_tokens must be positive, got {num_tokens}")
+        assert target_num_tokens >= 0
         
-        if num_tokens == 0:
-            return []
+        # Calculate how many blocks are needed for the target tokens
+        target_blocks_needed = (target_num_tokens + self.block_size - 1) // self.block_size
+        current_block_count = len(current_blocks)
         
-        num_blocks_needed = (num_tokens + self.block_size - 1) // self.block_size
+        # If we already have enough blocks, return current blocks
+        if current_block_count >= target_blocks_needed:
+            return current_blocks
+        
+        # Need to allocate more blocks
+        blocks_to_allocate = target_blocks_needed - current_block_count
         
         with self._lock:
-            if len(self._free_blocks) < num_blocks_needed:
-                raise RuntimeError(
-                    f"Not enough free blocks: need {num_blocks_needed}, "
-                    f"have {len(self._free_blocks)}"
-                )
+            if len(self._free_blocks) < blocks_to_allocate:
+                # Not enough free blocks to satisfy the request
+                return []
             
-            allocated_indices = []
-            for _ in range(num_blocks_needed):
+            allocated_indices = current_blocks[:]  # Copy current blocks
+            for _ in range(blocks_to_allocate):
                 block_idx = self._free_blocks.popleft()
                 allocated_indices.append(block_idx)
                 self._allocated_blocks.add(block_idx)
             
             return allocated_indices
-    
+
     def free_blocks(self, block_indices: List[int]) -> None:
         """
         Free previously allocated physical blocks.
@@ -114,7 +116,26 @@ class BlockManager:
                 if block_idx in self._allocated_blocks:
                     self._allocated_blocks.remove(block_idx)
                     self._free_blocks.append(block_idx)
-    
+
+    def needs_new_block(self, current_blocks: List[int], target_num_tokens: int) -> bool:
+        """
+        Check if the current blocks need to be extended to reach the target number of tokens.
+        
+        Args:
+            current_blocks: Current blocks allocated to the request
+            target_num_tokens: Target number of tokens the request needs to support
+            
+        Returns:
+            True if more blocks are needed, False if current blocks suffice
+        """
+        assert target_num_tokens >= 0
+        
+        # Calculate how many blocks are needed for the target tokens
+        target_blocks_needed = (target_num_tokens + self.block_size - 1) // self.block_size
+        current_block_count = len(current_blocks)
+        
+        return current_block_count < target_blocks_needed
+
     @property
     def num_free_blocks(self) -> int:
         """Get number of free blocks. Thread-safe and O(1)."""

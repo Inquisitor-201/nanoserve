@@ -14,6 +14,7 @@ from transformers import AutoTokenizer, AutoConfig
 from .model_executor import ModelExecutor
 from .backends import AttentionMetadata
 from .block_manager import BlockManager
+from .scheduler import Scheduler, Request
 
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,7 @@ class LLMService:
     - Inference execution with FlashInfer backend
     """
     
-    def __init__(self, device: str = "cuda"):
+    def __init__(self, model_path: str, config: Optional[Dict[str, Any]] = None, device: str = "cuda"):
         """
         Initialize LLM Service.
         
@@ -39,12 +40,13 @@ class LLMService:
         self.device = device if torch.cuda.is_available() else "cpu"
         self.model_executor: Optional[ModelExecutor] = None
         self.block_manager: Optional[BlockManager] = None
+        self.scheduler: Optional[Scheduler] = None
         self.tokenizer: Optional[AutoTokenizer] = None
         self.model_config: Optional[Dict[str, Any]] = None
         
-        logger.info(f"Initialized LLM Service on device: {self.device}")
-    
-    def load_model(
+        self._load_model(model_path, config)
+
+    def _load_model(
         self,
         model_path: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
@@ -81,6 +83,10 @@ class LLMService:
             hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
             self.model_config = hf_config.to_dict()
             
+            # Get the EOS token ID from tokenizer
+            self.eos_token_id = self.tokenizer.eos_token_id
+            logger.info(f"EOS token ID: {self.eos_token_id}")
+            
             logger.info(f"Loaded model config: {hf_config.model_type}, vocab_size={hf_config.vocab_size}")
             
             # Build configuration from HuggingFace config
@@ -116,8 +122,130 @@ class LLMService:
         # Extract block manager from executor
         self.block_manager = self.model_executor.block_manager
         
+        # Initialize scheduler
+        self.scheduler = Scheduler(self.block_manager)
+        
         logger.info("Successfully loaded Qwen3 model")
     
+    def add_requests(
+        self,
+        prompts: Union[str, List[str]],
+        max_new_tokens: int = 100,
+        temperature: float = 1.0,
+        top_p: float = 0.9,
+        **generate_kwargs
+    ) -> List[str]:
+        """
+        Add requests to the scheduler.
+        
+        Args:
+            prompts: Input prompt(s)
+            max_new_tokens: Maximum number of new tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling threshold
+            
+        Returns:
+            List of request IDs
+        """
+        if self.model_executor is None:
+            raise RuntimeError("No model loaded. Call load_model() first.")
+        
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer not loaded. Call load_model() first.")
+        
+        if self.scheduler is None:
+            raise RuntimeError("Scheduler not initialized. Call load_model() first.")
+
+        # Convert single prompt to list
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        
+        # Tokenize prompts
+        encoded = self.tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            return_tensors="pt"
+        )
+        input_ids_batch = encoded["input_ids"].to(self.device)
+        attention_mask = encoded["attention_mask"].to(self.device)
+        
+        batch_size = input_ids_batch.size(0)
+        
+        # Add each request to the scheduler
+        request_ids = []
+        for i in range(batch_size):
+            input_ids = input_ids_batch[i][attention_mask[i].bool()]  # Remove padding
+            req_id = self.scheduler.add_request(
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                eos_token_id=self.eos_token_id
+            )
+            request_ids.append(req_id)
+        
+        return request_ids
+
+    def main_loop(self, request_ids: List[str], temperature: float = 1.0, top_p: float = 0.9) -> List[str]:
+        """
+        Optimized main loop: orchestrates scheduling and execution.
+        """
+        step_id = 0
+        while self.scheduler.has_unfinished_requests():
+            # 1. Get next batch from scheduler
+            sched_output = self.scheduler.schedule()
+            
+            if not sched_output.scheduled_requests:
+                raise RuntimeError("No requests scheduled. This should not happen.")
+            
+            # 2. Execute inference (Prefill or Decode)
+            # The scheduler already separates phases, so we just check the first request
+            sampled_tokens = self._run_inference_step(
+                sched_output, temperature, top_p
+            )
+            
+            # 3. Update scheduler with results
+            # Wrap tokens in tensors to match your optimized scheduler's expected input
+            new_tokens = [t.view(1) for t in sampled_tokens]
+            active_ids = [req.request_id for req in sched_output.scheduled_requests]
+            
+            self.scheduler.update_running_requests(new_tokens, active_ids)
+            step_id += 1
+        # 4. Final output collection
+        return self._collect_results(request_ids)
+
+    def _run_inference_step(self, sched_output, temp, top_p):
+        """Unified inference step handling both Prefill and Decode."""
+        is_prefill = sched_output.is_prefill
+        
+        logits = self.model_executor.execute_batch(
+            input_ids=sched_output.input_ids,
+            block_tables=sched_output.block_tables,
+            seq_lengths=sched_output.seq_lengths,
+            is_prefill=is_prefill
+        )
+
+        if is_prefill:
+            indices = torch.cumsum(
+                torch.tensor(sched_output.seq_lengths, device=self.device), dim=0
+            ) - 1
+            logits = logits[indices]
+
+        return self.model_executor.sample(logits, temp, top_p)
+
+    def _collect_results(self, request_ids: List[str]) -> List[str]:
+        """Collect and decode results from completed requests."""
+        results = []
+        for req_id in request_ids:
+            req = self.scheduler.completed_requests.get(req_id)
+            if req and req.generated_tokens:
+                text = self.tokenizer.decode(req.generated_tokens, skip_special_tokens=True)
+                results.append(text)
+            else:
+                results.append("Error: Request not found or empty")
+        return results
+
     def generate(
         self,
         prompts: Union[str, List[str]],
@@ -127,7 +255,7 @@ class LLMService:
         **generate_kwargs
     ) -> List[str]:
         """
-        Generate text from prompts using Qwen3 model.
+        Generate text from prompts using Qwen3 model with scheduling.
         
         Args:
             prompts: Input prompt(s)
@@ -138,76 +266,22 @@ class LLMService:
         Returns:
             Generated text(s)
         """
-        if self.model_executor is None:
-            raise RuntimeError("No model loaded. Call load_model() first.")
-        
-        if self.tokenizer is None:
-            raise RuntimeError("Tokenizer not loaded. Call load_model() first.")
-
-        # Convert single prompt to list
-        if isinstance(prompts, str):
-            prompts = [prompts]
-        
-        encoded = self.tokenizer(
-            prompts,
-            padding=True,
-            truncation=True,
-            return_tensors="pt"
-        )
-        input_ids = encoded["input_ids"].to(self.device)
-        attention_mask = encoded["attention_mask"].to(self.device)
-            
-        batch_size, max_seq_len = input_ids.shape
-        seq_lengths = attention_mask.sum(dim=1).tolist()
-            
-        # UNPADDING: Remove padding tokens to create compact 1D tensor
-        # This is critical for FlashInfer Paged KV Cache to avoid wasting memory
-        flattened_input_ids = input_ids[attention_mask.bool()].contiguous()
-            
-        logger.info(f"Unpadding: batch_size={batch_size}, max_seq_len={max_seq_len}, total_tokens={flattened_input_ids.shape[0]}")
-
-        # Create initial block tables for KV cache allocation (considering max possible length)
-        block_tables = []
-        for seq_len in seq_lengths:
-            # Calculate total sequence length including max_new_tokens
-            total_expected_length = seq_len + max_new_tokens
-            # Calculate blocks needed for the total expected length
-            blocks = self.block_manager.allocate_blocks(total_expected_length)
-            if blocks is None:
-                raise RuntimeError(f"Failed to allocate blocks for sequence length {seq_len} + {max_new_tokens} new tokens")
-            block_tables.append(blocks)
-        
-        # Reset backend state for each new generation request to avoid cross-request contamination
-        if hasattr(self.model_executor.model, 'attention_backend') and hasattr(self.model_executor.model.attention_backend, 'reset_state'):
-            self.model_executor.model.attention_backend.reset_state()
-        
-        # Execute generation with unpadding
-        generated_ids = self.model_executor.generate(
-            input_ids=flattened_input_ids,  # Use flattened input (no padding)
-            block_tables=block_tables,
-            seq_lengths=seq_lengths,
+        # Add requests to scheduler
+        request_ids = self.add_requests(
+            prompts=prompts,
             max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            **generate_kwargs
+        )
+        
+        # Run main loop
+        generated_texts = self.main_loop(
+            request_ids=request_ids,
             temperature=temperature,
             top_p=top_p
         )
         
-        # Reshape generated_ids to [batch_size, max_new_tokens]
-        # Original order: [seq0_tok1, seq1_tok1, seq0_tok2, seq1_tok2, ...]
-        # Need to convert to: [seq0_tok1, seq0_tok2, ..., seq1_tok1, seq1_tok2, ...]
-        generated_ids_reshaped = generated_ids.view(max_new_tokens, batch_size).transpose(0, 1).contiguous()
-            
-        logger.info(f"Generated token IDs shape: {generated_ids_reshaped.shape}")
-        logger.info(f"Generated token IDs: {generated_ids_reshaped}")
-        # Detokenize generated IDs
-        generated_texts = []
-        for i in range(batch_size):
-            # Decode each batch individually
-            batch_generated_ids = generated_ids_reshaped[i]
-            decoded_text = self.tokenizer.decode(batch_generated_ids, skip_special_tokens=True)
-            generated_texts.append(decoded_text)
-            
-        logger.info(f"Decoded texts: {generated_texts}")
-
         return generated_texts
     
     def execute_prefill(

@@ -105,11 +105,12 @@ class ModelExecutor:
         
         logger.info(f"Initialized ModelExecutor with {model_name} model")
     
-    def execute_prefill(
+    def execute_batch(
         self,
         input_ids: torch.Tensor,
         block_tables: List[List[int]],
-        seq_lengths: List[int]
+        seq_lengths: List[int],
+        is_prefill: bool
     ) -> torch.Tensor:
         """
         Execute prefill phase.
@@ -122,15 +123,11 @@ class ModelExecutor:
         Returns:
             Hidden states after prefill
         """
-        # Validate block_tables is non-empty
-        if not block_tables or any(len(bt) == 0 for bt in block_tables):
-            raise ValueError("block_tables must be non-empty and contain valid block allocations")
-        
         # Create attention metadata for prefill
         metadata = AttentionMetadata.from_block_tables(
             block_tables=block_tables,
             seq_lengths=seq_lengths,
-            is_prefill=True,
+            is_prefill=is_prefill,
             page_size=self.block_size,
             device=self.device
         )
@@ -139,38 +136,7 @@ class ModelExecutor:
         logits = self.model(input_ids, metadata)
         
         return logits
-    
-    def execute_decode(
-        self,
-        input_ids: torch.Tensor,
-        block_tables: List[List[int]],
-        seq_lengths: List[int]
-    ) -> torch.Tensor:
-        """
-        Execute decode phase.
-        
-        Args:
-            input_ids: Input token IDs (one per sequence)
-            block_tables: Block tables for each sequence
-            seq_lengths: Sequence lengths
-            
-        Returns:
-            Hidden states after decode
-        """
-        # Create attention metadata for decode
-        metadata = AttentionMetadata.from_block_tables(
-            block_tables=block_tables,
-            seq_lengths=seq_lengths,
-            is_prefill=False,
-            page_size=self.block_size,
-            device=self.device
-        )
-        
-        # Execute model forward pass
-        hidden_states = self.model(input_ids, metadata)
-        
-        return hidden_states
-    
+
     def generate(
         self,
         input_ids: torch.Tensor,
@@ -214,7 +180,7 @@ class ModelExecutor:
         
         # Extract logits for the last token of each sequence
         last_logits = logits[last_token_positions]
-        next_tokens = self._sample(last_logits, temperature, top_p)
+        next_tokens = self.sample(last_logits, temperature, top_p)
         generated_ids.append(next_tokens)
         
         # Update sequence lengths
@@ -227,7 +193,7 @@ class ModelExecutor:
             logits = self.execute_decode(next_tokens, block_tables, current_seq_lengths)
             
             # Sample next tokens
-            next_tokens = self._sample(logits, temperature, top_p)
+            next_tokens = self.sample(logits, temperature, top_p)
             generated_ids.append(next_tokens)
             
             # Update sequence lengths
@@ -238,7 +204,7 @@ class ModelExecutor:
         generated_ids = torch.cat(generated_ids, dim=0)
         return generated_ids
     
-    def _sample(
+    def sample(
         self,
         logits: torch.Tensor,
         temperature: float,
