@@ -13,6 +13,7 @@ from .backends import AttentionMetadata, FlashInferBackend
 from .models import Qwen3Model
 from .block_manager import BlockManager
 from .model_loader import ModelLoader
+from .config import ModelConfig, EngineArgs
 
 
 logger = logging.getLogger(__name__)
@@ -23,64 +24,45 @@ class ModelExecutor:
     Model executor for managing the complete inference pipeline.
     
     This executor ensures proper coordination between models and attention backends.
+    All model structure parameters are dynamically initialized based on ModelConfig,
+    ensuring complete match with loaded weights.
     """
     
     def __init__(
         self,
+        model_config: ModelConfig,
+        engine_args: EngineArgs,
         model_name: str = "qwen3",
-        vocab_size: int = 32000,
-        hidden_size: int = 4096,
-        num_heads: int = 32,
-        num_key_value_heads: Optional[int] = None,
-        head_dim: int = 128,
-        intermediate_size: int = 11008,
-        num_layers: int = 32,
-        attention_backend: str = "flashinfer",
-        dtype: torch.dtype = torch.bfloat16,
-        device: str = "cuda",
-        num_blocks: int = 1000,
-        block_size: int = 16,
-        model_path: Optional[str] = None,
-        rope_theta: float = 1000000.0
     ):
         """
-        Initialize model executor with GQA support.
+        Initialize model executor with config-based parameters.
         
         Args:
+            model_config: ModelConfig containing model structure parameters
+            engine_args: EngineArgs containing resource allocation parameters
             model_name: Name of the model architecture
-            vocab_size: Vocabulary size
-            hidden_size: Hidden size of the model
-            num_heads: Number of attention heads (Query heads)
-            num_key_value_heads: Number of key/value heads (for GQA). If None, defaults to num_heads
-            head_dim: Dimension of each attention head
-            intermediate_size: Intermediate size for MLP
-            num_layers: Number of decoder layers
-            attention_backend: Attention backend type
-            dtype: Data type for computations
-            device: Computing device
-            num_blocks: Number of KV cache blocks
-            block_size: Size of each cache block
-            model_path: Path to model weights for loading
-            rope_theta: Base for RoPE rotary embeddings (default: 1M for Qwen3)
         """
         self.model_name = model_name
-        self.device = device
-        self.dtype = dtype
-        self.block_size = block_size
+        self.device = engine_args.device
+        self.dtype = model_config.dtype
+        self.block_size = engine_args.block_size
+        self.model_config = model_config
+        self.engine_args = engine_args
         
-        # Initialize block manager for KV cache management
         self.block_manager = BlockManager(
-            num_blocks=num_blocks,
-            num_layers=num_layers,
-            num_key_value_heads=num_key_value_heads,
-            head_dim=head_dim,
-            block_size=block_size,
-            dtype=dtype,
-            device=device
+            model_config=model_config,
+            engine_args=engine_args
         )
 
-        # Initialize model based on model name
         if model_name == "qwen3":
+            vocab_size = model_config.vocab_size
+            hidden_size = model_config.hidden_size
+            num_heads = model_config.num_heads
+            num_key_value_heads = model_config.num_key_value_heads
+            head_dim = model_config.head_dim
+            intermediate_size = model_config.intermediate_size
+            num_layers = model_config.num_layers
+            
             self.model = Qwen3Model(
                 vocab_size=vocab_size,
                 hidden_size=hidden_size,
@@ -89,21 +71,29 @@ class ModelExecutor:
                 head_dim=head_dim,
                 intermediate_size=intermediate_size,
                 num_layers=num_layers,
-                attention_backend_type=attention_backend,
-                dtype=dtype,
-                device=device,
+                attention_backend_type=engine_args.attention_backend,
+                dtype=self.dtype,
+                device=self.device,
                 kv_cache_pool=self.block_manager.kv_cache_pool,
-                rope_theta=rope_theta
+                rope_theta=model_config.rope_theta,
+                block_size=engine_args.block_size
             )
             
-            # Load model weights if path provided
-            if model_path:
-                ModelLoader.load_weights(self.model, model_path, dtype, device)
+            if engine_args.model_path:
+                ModelLoader.load_weights(
+                    self.model, 
+                    engine_args.model_path, 
+                    self.dtype, 
+                    self.device
+                )
                 
         else:
             raise ValueError(f"Unsupported model: {model_name}")
         
-        logger.info(f"Initialized ModelExecutor with {model_name} model")
+        logger.info(f"Initialized ModelExecutor with {model_name} model: "
+                   f"hidden_size={model_config.hidden_size}, "
+                   f"num_heads={model_config.num_heads}, "
+                   f"num_layers={model_config.num_layers}")
     
     def execute_batch(
         self,
@@ -251,16 +241,3 @@ class ModelExecutor:
         next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
         
         return next_tokens
-    
-    def get_model_info(self) -> Dict[str, Any]:
-        """Get model information."""
-        return {
-            "model_name": self.model_name,
-            "device": self.device,
-            "dtype": str(self.dtype),
-            "model": str(self.model),
-            "block_manager": str(self.block_manager)
-        }
-    
-    def __repr__(self) -> str:
-        return f"ModelExecutor(model_name={self.model_name}, device={self.device})"

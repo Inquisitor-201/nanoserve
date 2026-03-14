@@ -28,10 +28,9 @@ class TestTransformerCompare(unittest.TestCase):
         self.llm_service.load_model(model_path=self.model_path, config=config)
         
         # Load transformers model and tokenizer
-        self.transformer_tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
+        self.transformer_tokenizer = AutoTokenizer.from_pretrained(self.model_path)
         self.transformer_model = AutoModelForCausalLM.from_pretrained(
             self.model_path, 
-            trust_remote_code=True,
             torch_dtype=torch.float16,
             device_map="auto"
         )

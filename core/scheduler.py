@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .block_manager import BlockManager
+from .config import SamplingConfig, ModelConfig, EngineArgs
+
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +34,7 @@ class Request:
     input_ids: torch.Tensor
     block_tables: List[int]
     computed_num_tokens: int
-    max_new_tokens: int
-    temperature: float = 1.0
-    top_p: float = 0.9
+    sampling_config: SamplingConfig
     created_at: float = 0.0
     state: RequestState = RequestState.WAITING
     generated_tokens: List[int] = None
@@ -47,7 +47,7 @@ class Request:
     def is_finished(self) -> bool:
         if self.generated_tokens and self.generated_tokens[-1] == self.eos_token_id:
             return True
-        return len(self.generated_tokens) >= self.max_new_tokens
+        return len(self.generated_tokens) >= self.sampling_config.max_new_tokens
     
     def get_last_token(self) -> int:
         return self.generated_tokens[-1] if self.generated_tokens else self.input_ids[-1].item()
@@ -62,8 +62,23 @@ class SchedulerOutput(NamedTuple):
     seq_lengths: List[int]
 
 class Scheduler:
-    def __init__(self, block_manager: BlockManager):
+    def __init__(
+        self,
+        block_manager: BlockManager,
+        model_config: Optional[ModelConfig] = None,
+        engine_args: Optional[EngineArgs] = None,
+    ):
+        """
+        Initialize Scheduler with config-based parameters.
+        
+        Args:
+            block_manager: BlockManager instance for KV cache allocation
+            model_config: ModelConfig containing model structure parameters (optional for backward compatibility)
+            engine_args: EngineArgs containing resource allocation parameters (optional for backward compatibility)
+        """
         self.block_manager = block_manager
+        self.model_config = model_config
+        self.engine_args = engine_args
         self.waiting_list: Deque[Request] = deque()
         self.running_list: Deque[Request] = deque()
         self.completed_requests: Dict[str, Request] = {}
@@ -71,18 +86,22 @@ class Scheduler:
         
         logger.info("Initialized Anti-Thrashing Scheduler")
 
-    def add_request(self, input_ids: torch.Tensor, **kwargs) -> str:
+    def add_request(
+        self,
+        input_ids: torch.Tensor,
+        sampling_config: SamplingConfig,
+        eos_token_id: int = 2,
+    ) -> str:
         request_id = f"req_{self.request_id_counter}"
         self.request_id_counter += 1
+        
         request = Request(
             request_id=request_id,
             input_ids=input_ids,
             block_tables=[],
             computed_num_tokens=0,
-            max_new_tokens=kwargs.get("max_new_tokens", 100),
-            temperature=kwargs.get("temperature", 1.0),
-            top_p=kwargs.get("top_p", 0.9),
-            eos_token_id=kwargs.get("eos_token_id", 2)
+            sampling_config=sampling_config,
+            eos_token_id=eos_token_id
         )
         self.waiting_list.append(request)
         return request_id

@@ -16,6 +16,8 @@ from typing import List, Deque
 from collections import deque
 import threading
 
+from .config import ModelConfig, EngineArgs
+
 
 class BlockManager:
     """
@@ -27,27 +29,26 @@ class BlockManager:
     
     def __init__(
         self,
-        num_blocks: int,
-        num_layers: int,
-        num_key_value_heads: int,
-        head_dim: int,
-        block_size: int,
-        dtype: torch.dtype = torch.bfloat16,
-        device: str = "cuda"
+        model_config: ModelConfig,
+        engine_args: EngineArgs,
     ):
         """
         Initialize BlockManager with pre-allocated KV cache pool.
         
         Args:
-            num_blocks: Total number of physical blocks
-            num_layers: Number of transformer layers
-            num_key_value_heads: Number of key/value heads (for GQA)
-            head_dim: Dimension of each attention head
-            block_size: Size of each block in tokens
-            dtype: Data type for the tensor
-            device: Device to allocate tensor on
+            model_config: ModelConfig containing model structure parameters
+            engine_args: EngineArgs containing resource allocation parameters
         """
-        self.num_blocks = num_blocks
+        self.num_blocks = engine_args.num_blocks
+        num_layers = model_config.num_layers
+        num_key_value_heads = model_config.num_key_value_heads
+        head_dim = model_config.head_dim
+        block_size = engine_args.block_size
+        dtype = model_config.dtype
+        device = engine_args.device
+        
+        self._validate_block_size_consistency(block_size, model_config.page_size)
+        
         self.num_layers = num_layers
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
@@ -56,14 +57,27 @@ class BlockManager:
         self.device = device
         
         self.kv_cache_pool = torch.zeros(
-            (num_layers, num_blocks, 2, block_size, num_key_value_heads, head_dim),
+            (num_layers, self.num_blocks, 2, block_size, num_key_value_heads, head_dim),
             dtype=dtype,
             device=device
         )
         
-        self._free_blocks: Deque[int] = deque(range(num_blocks))
+        self._free_blocks: Deque[int] = deque(range(self.num_blocks))
         self._allocated_blocks = set()
         self._lock = threading.Lock()
+        
+        logger.info(f"BlockManager initialized: num_blocks={self.num_blocks}, "
+                   f"block_size={block_size}, num_layers={num_layers}, "
+                   f"num_kv_heads={num_key_value_heads}, head_dim={head_dim}")
+
+    def _validate_block_size_consistency(self, engine_block_size: int, model_page_size: int) -> None:
+        if engine_block_size != model_page_size:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                f"Block size mismatch: EngineArgs.block_size={engine_block_size}, "
+                f"ModelConfig.page_size={model_page_size}. Using engine_args.block_size={engine_block_size}."
+            )
 
     def allocate_blocks(self, current_blocks: List[int], target_num_tokens: int) -> List[int]:
         """

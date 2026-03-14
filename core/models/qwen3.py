@@ -44,7 +44,8 @@ class Qwen3Model(nn.Module):
         dtype: torch.dtype,
         device: str,
         kv_cache_pool: torch.Tensor,
-        rope_theta: float = 1000000.0
+        rope_theta: float,
+        block_size: int,
     ):
         """
         Initialize Qwen3 model.
@@ -62,6 +63,7 @@ class Qwen3Model(nn.Module):
             device: Computing device
             kv_cache_pool: Pre-allocated KV cache pool from BlockManager
             rope_theta: Base for RoPE rotary embeddings (default: 1M for Qwen3)
+            block_size: Size of each cache block (must match BlockManager)
         """
         super().__init__()
         
@@ -69,6 +71,7 @@ class Qwen3Model(nn.Module):
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.rope_theta = rope_theta
+        self.block_size = block_size
         
         # Token embedding (generic layer)
         self.embed_tokens = Embedding(
@@ -85,7 +88,7 @@ class Qwen3Model(nn.Module):
                 head_dim=head_dim,
                 kv_cache_pool=kv_cache_pool,
                 num_key_value_heads=num_key_value_heads,
-                page_size=16,
+                page_size=block_size,
                 dtype=dtype,
                 device=device
             )
@@ -95,7 +98,7 @@ class Qwen3Model(nn.Module):
                 head_dim=head_dim,
                 kv_cache_pool=kv_cache_pool,
                 num_key_value_heads=num_key_value_heads,
-                page_size=16,
+                page_size=block_size,
                 dtype=dtype,
                 device=device
             )

@@ -6,15 +6,12 @@ Provides high-level API for model loading, configuration, and inference.
 import logging
 from typing import Dict, Any, Optional, List, Union
 import torch
-import json
-import os
-from pathlib import Path
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer
 
 from .model_executor import ModelExecutor
-from .backends import AttentionMetadata
 from .block_manager import BlockManager
 from .scheduler import Scheduler, Request
+from .config import SamplingConfig, ModelConfig, EngineArgs
 
 
 logger = logging.getLogger(__name__)
@@ -28,121 +25,90 @@ class LLMService:
     - Model loading and configuration
     - KV cache management
     - Inference execution with FlashInfer backend
+    
+    The LLMService only receives EngineArgs in its constructor and internally
+    initializes ModelConfig from HuggingFace config, distributing both to
+    sub-components for a single source of truth architecture.
     """
     
-    def __init__(self, model_path: str, config: Optional[Dict[str, Any]] = None, device: str = "cuda"):
+    def __init__(
+        self,
+        engine_args: EngineArgs,
+        model_config: Optional[ModelConfig] = None,
+    ):
         """
-        Initialize LLM Service.
+        Initialize LLM Service with EngineArgs.
         
         Args:
-            device: Computing device ("cuda" or "cpu")
+            engine_args: EngineArgs containing model_path and resource allocation parameters
+            model_config: Optional ModelConfig for overriding defaults (recommended to use EngineArgs only)
         """
-        self.device = device if torch.cuda.is_available() else "cpu"
+        self.engine_args = engine_args
+        self.device = engine_args.device if torch.cuda.is_available() else "cpu"
         self.model_executor: Optional[ModelExecutor] = None
         self.block_manager: Optional[BlockManager] = None
         self.scheduler: Optional[Scheduler] = None
         self.tokenizer: Optional[AutoTokenizer] = None
-        self.model_config: Optional[Dict[str, Any]] = None
+        self.model_config: Optional[ModelConfig] = None
+        self._model_path = engine_args.model_path
         
-        self._load_model(model_path, config)
+        self._load_model()
 
-    def _load_model(
-        self,
-        model_path: Optional[str] = None,
-        config: Optional[Dict[str, Any]] = None,
-        **kwargs
-    ):
+    def _load_model(self) -> None:
         """
-        Load Qwen3 model with specified configuration.
+        Load Qwen3 model with config-based parameters.
         
-        Args:
-            model_path: Path to the HuggingFace model directory
-            config: Model configuration override
-            **kwargs: Additional configuration parameters
-            
-        Returns:
-            Model name
+        ModelConfig is automatically created from HuggingFace config.json,
+        ensuring complete match with model weights.
         """
-        logger.info("Loading Qwen3 model")
+        logger.info(f"Loading Qwen3 model from {self._model_path}")
         
-        # Load from HuggingFace model if path provided
-        if model_path:
-            logger.info(f"Loading model from {model_path}")
-            
-            # Load tokenizer
-            try:
-                self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
-            except Exception as e:
-                logger.warning(f"Failed to load fast tokenizer: {e}, trying slow tokenizer")
-                self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
-            
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-            
-            # Load model config
-            hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-            self.model_config = hf_config.to_dict()
-            
-            # Get the EOS token ID from tokenizer
-            self.eos_token_id = self.tokenizer.eos_token_id
-            logger.info(f"EOS token ID: {self.eos_token_id}")
-            
-            logger.info(f"Loaded model config: {hf_config.model_type}, vocab_size={hf_config.vocab_size}")
-            
-            # Build configuration from HuggingFace config
-            model_config = {
-                "model_name": hf_config.model_type,
-                "vocab_size": hf_config.vocab_size,
-                "hidden_size": hf_config.hidden_size,
-                "num_heads": hf_config.num_attention_heads,
-                "num_key_value_heads": getattr(hf_config, 'num_key_value_heads', hf_config.num_attention_heads),
-                "head_dim": getattr(hf_config, 'head_dim', hf_config.hidden_size // hf_config.num_attention_heads),
-                "intermediate_size": hf_config.intermediate_size,
-                "num_layers": hf_config.num_hidden_layers,
-                "attention_backend": "flashinfer",
-                "dtype": torch.bfloat16,  # Use float16 for compatibility
-                "device": self.device,
-                "num_blocks": 1000,
-                "block_size": 16,
-            }
-        else:
-            # Raise exception
-            raise ValueError("model_path must be provided when loading from HuggingFace model")
-
-        # Merge configurations (user config overrides defaults)
-        final_config = {**model_config, **(config or {}), **kwargs}
+        self.tokenizer = AutoTokenizer.from_pretrained(self._model_path)
         
-        # Pass model_path to executor if available
-        if model_path:
-            final_config['model_path'] = model_path
+        self.eos_token_id = self.tokenizer.eos_token_id
+        logger.info(f"EOS token ID: {self.eos_token_id}")
         
-        # Initialize model executor
-        self.model_executor = ModelExecutor(**final_config)
+        # Create ModelConfig: HuggingFace provides model structure, EngineArgs provides resource params
+        self.model_config = ModelConfig.from_hf_config(
+            model_path=self._model_path,
+            num_blocks=self.engine_args.num_blocks,
+            page_size=self.engine_args.block_size,
+            rope_theta=1000000.0,
+            dtype=self.engine_args.dtype,
+            override_config=model_config,
+        )
         
-        # Extract block manager from executor
+        logger.info(f"ModelConfig created: hidden_size={self.model_config.hidden_size}, "
+                   f"num_heads={self.model_config.num_heads}, "
+                   f"num_layers={self.model_config.num_layers}")
+        
+        self.model_executor = ModelExecutor(
+            model_config=self.model_config,
+            engine_args=self.engine_args,
+            model_name="qwen3"
+        )
+        
         self.block_manager = self.model_executor.block_manager
         
-        # Initialize scheduler
-        self.scheduler = Scheduler(self.block_manager)
+        self.scheduler = Scheduler(
+            block_manager=self.block_manager,
+            model_config=self.model_config,
+            engine_args=self.engine_args
+        )
         
-        logger.info("Successfully loaded Qwen3 model")
+        logger.info("Successfully loaded Qwen3 model with config-based initialization")
     
     def add_requests(
         self,
         prompts: Union[str, List[str]],
-        max_new_tokens: int = 100,
-        temperature: float = 1.0,
-        top_p: float = 0.9,
-        **generate_kwargs
+        sampling_config: SamplingConfig,
     ) -> List[str]:
         """
         Add requests to the scheduler.
         
         Args:
             prompts: Input prompt(s)
-            max_new_tokens: Maximum number of new tokens to generate
-            temperature: Sampling temperature
-            top_p: Top-p sampling threshold
+            sampling_config: SamplingConfig object
             
         Returns:
             List of request IDs
@@ -156,11 +122,9 @@ class LLMService:
         if self.scheduler is None:
             raise RuntimeError("Scheduler not initialized. Call load_model() first.")
 
-        # Convert single prompt to list
         if isinstance(prompts, str):
             prompts = [prompts]
         
-        # Tokenize prompts
         encoded = self.tokenizer(
             prompts,
             padding=True,
@@ -172,37 +136,39 @@ class LLMService:
         
         batch_size = input_ids_batch.size(0)
         
-        # Add each request to the scheduler
         request_ids = []
         for i in range(batch_size):
-            input_ids = input_ids_batch[i][attention_mask[i].bool()]  # Remove padding
+            input_ids = input_ids_batch[i][attention_mask[i].bool()]
             req_id = self.scheduler.add_request(
                 input_ids=input_ids,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
+                sampling_config=sampling_config,
                 eos_token_id=self.eos_token_id
             )
             request_ids.append(req_id)
         
         return request_ids
 
-    def main_loop(self, request_ids: List[str], temperature: float = 1.0, top_p: float = 0.9) -> List[str]:
+    def main_loop(
+        self,
+        request_ids: List[str],
+        sampling_config: SamplingConfig,
+    ) -> List[str]:
         """
         Optimized main loop: orchestrates scheduling and execution.
+        
+        Args:
+            request_ids: List of request IDs
+            sampling_config: SamplingConfig object
         """
         step_id = 0
         while self.scheduler.has_unfinished_requests():
-            # 1. Get next batch from scheduler
             sched_output = self.scheduler.schedule()
             
             if not sched_output.scheduled_requests:
                 raise RuntimeError("No requests scheduled. This should not happen.")
             
-            # 2. Execute inference (Prefill or Decode)
-            # The scheduler already separates phases, so we just check the first request
             sampled_tokens = self._run_inference_step(
-                sched_output, temperature, top_p
+                sched_output, sampling_config
             )
             
             # 3. Update scheduler with results
@@ -215,7 +181,7 @@ class LLMService:
         # 4. Final output collection
         return self._collect_results(request_ids)
 
-    def _run_inference_step(self, sched_output, temp, top_p):
+    def _run_inference_step(self, sched_output, sampling_config: SamplingConfig):
         """Unified inference step handling both Prefill and Decode."""
         is_prefill = sched_output.is_prefill
         
@@ -232,7 +198,11 @@ class LLMService:
             ) - 1
             logits = logits[indices]
 
-        return self.model_executor.sample(logits, temp, top_p)
+        return self.model_executor.sample(
+            logits,
+            sampling_config.temperature,
+            sampling_config.top_p
+        )
 
     def _collect_results(self, request_ids: List[str]) -> List[str]:
         """Collect and decode results from completed requests."""
@@ -249,37 +219,26 @@ class LLMService:
     def generate(
         self,
         prompts: Union[str, List[str]],
-        max_new_tokens: int = 100,
-        temperature: float = 1.0,
-        top_p: float = 0.9,
-        **generate_kwargs
+        sampling_config: SamplingConfig,
     ) -> List[str]:
         """
         Generate text from prompts using Qwen3 model with scheduling.
         
         Args:
             prompts: Input prompt(s)
-            max_new_tokens: Maximum number of new tokens to generate
-            temperature: Sampling temperature
-            top_p: Top-p sampling threshold
+            sampling_config: SamplingConfig object
             
         Returns:
             Generated text(s)
         """
-        # Add requests to scheduler
         request_ids = self.add_requests(
             prompts=prompts,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            **generate_kwargs
+            sampling_config=sampling_config,
         )
         
-        # Run main loop
         generated_texts = self.main_loop(
             request_ids=request_ids,
-            temperature=temperature,
-            top_p=top_p
+            sampling_config=sampling_config
         )
         
         return generated_texts

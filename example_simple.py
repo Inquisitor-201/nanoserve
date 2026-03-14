@@ -5,7 +5,7 @@ Simple example demonstrating text generation with Qwen3 model.
 
 import logging
 import torch
-from core import LLMService
+from core import LLMService, SamplingConfig, ModelConfig, EngineArgs
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -18,18 +18,22 @@ def main():
     print("=" * 40)
     
     try:
-        # Load with optimized configuration for the real model
-        real_config = {
-            "dtype": torch.bfloat16,
-            "num_blocks": 400,
-            "block_size": 16,
-            "attention_backend": "flashinfer",
-        }
+        engine_args = EngineArgs(
+            model_path="./models/Qwen3-0.6B",
+            device="cuda",
+            num_blocks=400,
+            block_size=16,
+        )
 
-        llm_service = LLMService(model_path="./models/Qwen3-0.6B",
-                                 device="cuda",
-                                 config=real_config)
+        llm_service = LLMService(engine_args=engine_args)
         print(f"✅ Model loaded successfully on device: {llm_service.device}")
+        
+        # Create sampling config
+        sampling_config = SamplingConfig(
+            temperature=0.4,
+            max_new_tokens=400,
+        )
+        
         # Simple text generation
         print("\n📝 Generating text...")
         prompts = ["中国是一个", 
@@ -40,8 +44,7 @@ def main():
         print(f"Input: {prompts}")
         generated_texts = llm_service.generate(
             prompts=prompts,
-            max_new_tokens=400,  # Increased to test dynamic block allocation
-            temperature=0.4
+            sampling_config=sampling_config,
         )
         
         print(f"\n✅ Generated text:")

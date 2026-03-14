@@ -9,6 +9,7 @@ from .models import Qwen3Model
 from .model_executor import ModelExecutor
 from .block_manager import BlockManager
 from .llm_service import LLMService
+from .config import SamplingConfig, ModelConfig, EngineArgs
 
 __all__ = [
     "AttentionMetadata",
@@ -20,5 +21,8 @@ __all__ = [
     "Qwen3Model",
     "ModelExecutor",
     "BlockManager",
-    "LLMService"
+    "LLMService",
+    "SamplingConfig",
+    "ModelConfig",
+    "EngineArgs",
 ]

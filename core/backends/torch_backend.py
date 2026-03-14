@@ -32,7 +32,6 @@ class TorchBackend:
         dtype: torch.dtype,
         device: str,
         kv_cache_pool: torch.Tensor,
-        page_size: int = 16,  # Added for compatibility
     ):
         """
         Initialize TorchBackend.
