@@ -13,7 +13,7 @@ class TestTransformerCompare(unittest.TestCase):
     def setUp(self):
         self.model_path = "/root/nanoserve/models/Qwen3-0.6B"
         self.device = "cuda"
-        self.temperature = 0.0  # 贪婪采样
+        self.temperature = 0.0  # Greedy sampling
         self.max_new_tokens = 20
         self.prompts = ["Hello, world!", "Please tell me, the future of AI is"]
         

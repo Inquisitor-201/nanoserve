@@ -5,7 +5,7 @@ from typing import List
 class StatsCollector:
     def __init__(self):
         self.ttft = 0.0
-        self.itl_list = []  # 存每一次 decode 的耗时
+        self.itl_list = []  # Store each decode latency
 
     def add_record(self, latency, is_prefill):
         if is_prefill:
@@ -27,17 +27,17 @@ class ProfileTimer:
         self.is_prefill = is_prefill
 
     def __enter__(self):
-        # 翻转沙漏：开始计时
-        torch.cuda.synchronize() # 保证 GPU 之前的活干完了
+        # Flip the hourglass: start timing
+        torch.cuda.synchronize() # Ensure GPU has finished previous work
         self.start = time.perf_counter()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        # 沙漏流完：结束计时
-        torch.cuda.synchronize() # 保证 GPU 刚干的活干完了
+        # Hourglass finished: end timing
+        torch.cuda.synchronize() # Ensure GPU has finished current work
         latency = time.perf_counter() - self.start
         
-        # 【核心步骤】：把结果传给账本
+        # [Core step]: Pass the result to the ledger
         self.collector.add_record(latency, self.is_prefill)
 
 class ContinuousBatchTimer:
@@ -53,13 +53,13 @@ class ContinuousBatchTimer:
         torch.cuda.synchronize()
         step_latency = time.perf_counter() - self.start
         
-        # 核心逻辑：给这轮所有的 Request 记账
+        # Core logic: Record time for all requests in this batch
         for req in self.active_requests:
-            m = req.metrics  # 获取账本
+            m = req.metrics  # Get ledger
             if req.is_prefill:
-                # 如果是 prefill 状态，这一轮的耗时就是它的 TTFT
+                # If in prefill state, this batch's latency is its TTFT
                 m.ttft = time.perf_counter() - m.arrival_time
                 m.start_inference_time = time.perf_counter()
             else:
-                # 如果是 decode 状态，记入 ITL 列表
+                # If in decode state, add to ITL list
                 m.decode_latencies.append(step_latency)

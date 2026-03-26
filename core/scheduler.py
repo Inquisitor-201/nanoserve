@@ -31,7 +31,7 @@ class RequestState(Enum):
 
 @dataclass
 class RequestMetrics:
-    """专门负责记录请求的性能画像"""
+    """Dedicated to recording request performance profiles"""
     arrival_time: float = 0.0
     start_inference_time: float = None
     ttft: float = 0.0
@@ -58,29 +58,42 @@ class Request:
     sampling_config: SamplingConfig
     created_at: float = 0.0
     state: RequestState = RequestState.WAITING
-    generated_tokens: List[int] = None
     eos_token_id: int = 2
-    # 将 Profile 数据收拢到一个对象里
+    # Profile data wrapped in a single object
     metrics: RequestMetrics = None
+    # Unified storage for all token_ids
+    token_ids: List[int] = None
+    # Original prompt length, used to determine if it's still in prefill phase
+    prompt_length: int = 0
     
     def __post_init__(self):
-        if self.generated_tokens is None:
-            self.generated_tokens = []
         if self.metrics is None:
             self.metrics = RequestMetrics()
+        if self.token_ids is None:
+            # Convert input_ids to list for storage during initialization
+            self.token_ids = self.input_ids.tolist()
+            self.prompt_length = len(self.token_ids)
     
     @property
     def is_prefill(self):
-        # 如果还没产生过任何生成的 token，说明还没做完 prefill
-        return len(self.generated_tokens) == 0
-    
-    def is_finished(self) -> bool:
-        if self.generated_tokens and self.generated_tokens[-1] == self.eos_token_id:
-            return True
-        return len(self.generated_tokens) >= self.sampling_config.max_new_tokens
+        # If token_ids length equals original prompt length, it means prefill hasn't finished yet
+        return len(self.token_ids) == self.prompt_length
     
     def get_last_token(self) -> int:
-        return self.generated_tokens[-1] if self.generated_tokens else self.input_ids[-1].item()
+        return self.token_ids[-1]
+    
+    def add_token(self, token: int):
+        self.token_ids.append(token)
+    
+    def is_finished(self) -> bool:
+        if self.token_ids and self.token_ids[-1] == self.eos_token_id:
+            return True
+        # Number of generated tokens equals total tokens minus original prompt length
+        generated_tokens_count = len(self.token_ids) - self.prompt_length
+        return generated_tokens_count >= self.sampling_config.max_new_tokens
+    
+    def get_last_token(self) -> int:
+        return self.token_ids[-1]
 
 class SchedulerOutput(NamedTuple):
     is_prefill: bool
@@ -140,7 +153,8 @@ class Scheduler:
         self.block_manager.free_blocks(victim.block_tables)
         victim.block_tables = []
         victim.computed_num_tokens = 0
-        victim.generated_tokens = []
+        # Preserve token_ids so that prefill can start from "prompt + generated tokens" when rescheduling
+        # victim.generated_tokens = []
         victim.state = RequestState.PREEMPTED
         self.waiting_list.appendleft(victim) # Priority resume
 
@@ -174,7 +188,9 @@ class Scheduler:
         # but we only start if enough blocks exist.
         while self.waiting_list:
             req = self.waiting_list[0]
-            blocks = self.block_manager.allocate_blocks([], len(req.input_ids))
+            # Use unified token_ids storage
+            blocks = self.block_manager.allocate_blocks([], len(req.token_ids))
+            
             if blocks:
                 req = self.waiting_list.popleft()
                 req.block_tables = blocks
@@ -187,12 +203,19 @@ class Scheduler:
         if not scheduled:
             # If no prefill can start, try to decode existing ones instead
             return self._schedule_decode() if self.running_list else self._build_output([], [], [], [])
+        
+        # Build output using unified token_ids
+        input_ids_list = []
+        seq_lengths = []
+        for r in scheduled:
+            input_ids_list.extend(r.token_ids)
+            seq_lengths.append(len(r.token_ids))
 
         return self._build_output(
             scheduled, 
-            [t for r in scheduled for t in r.input_ids.tolist()],
+            input_ids_list,
             [r.block_tables for r in scheduled],
-            [len(r.input_ids) for r in scheduled],
+            seq_lengths,
             is_prefill=True
         )
 
@@ -255,8 +278,9 @@ class Scheduler:
                 new_token_raw = token_update_map[req_id]
                 new_token = new_token_raw.item() if isinstance(new_token_raw, torch.Tensor) else int(new_token_raw)
                 
-                request.computed_num_tokens = len(request.input_ids) + len(request.generated_tokens)
-                request.generated_tokens.append(new_token)
+                # Use unified token_ids storage
+                request.add_token(new_token)
+                request.computed_num_tokens = len(request.token_ids)
                 updated_requests.append(request)
 
                 if request.is_finished():

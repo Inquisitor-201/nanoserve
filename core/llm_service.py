@@ -44,15 +44,15 @@ class LLMService:
         self.eos_token_id = self.tokenizer.eos_token_id
         logger.info(f"EOS token ID: {self.eos_token_id}")
         
-        # 2. 生产管家 (BlockManager)
-        # BlockManager 在这里创建并分配显存池
+        # 2. Initialize BlockManager
+        # BlockManager creates and allocates GPU memory pool here
         self.block_manager = BlockManager(
             model_config=model_config,
             cache_config=cache_config
         )
         
-        # 3. 生产执行器 (ModelExecutor)
-        # 将 BlockManager 的池子传进去
+        # 3. Initialize ModelExecutor
+        # Pass the BlockManager's pool to it
         self.model_executor = ModelExecutor(
             model_config=model_config,
             cache_config=cache_config,
@@ -61,8 +61,8 @@ class LLMService:
             attention_backend=attention_backend
         )
         
-        # 4. 生产调度器
-        # 将 BlockManager 传给它用于请求调度
+        # 4. Initialize Scheduler
+        # Pass the BlockManager to it for request scheduling
         self.scheduler = Scheduler(scheduler_config, self.block_manager)
     @classmethod
     def from_engine_args(cls, engine_args: EngineArgs) -> "LLMService":
@@ -210,8 +210,10 @@ class LLMService:
         results = []
         for req_id in request_ids:
             req = self.scheduler.completed_requests.get(req_id)
-            if req and req.generated_tokens:
-                text = self.tokenizer.decode(req.generated_tokens, skip_special_tokens=True)
+            if req:
+                # Extract generated tokens (total tokens minus original prompt length)
+                generated_tokens = req.token_ids[req.prompt_length:]
+                text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
                 results.append(text)
             else:
                 results.append("Error: Request not found or empty")
@@ -311,10 +313,12 @@ class LLMService:
         for req_id, req in self.scheduler.completed_requests.items():
             metrics = req.metrics
             avg_itl = sum(metrics.decode_latencies) / len(metrics.decode_latencies) if metrics.decode_latencies else 0
+            # Number of generated tokens equals total tokens minus original prompt length
+            generated_tokens_count = len(req.token_ids) - req.prompt_length
             stats[req_id] = {
                 "ttft": metrics.ttft,
                 "avg_itl": avg_itl,
-                "total_tokens": len(req.generated_tokens),
+                "total_tokens": generated_tokens_count,
                 "decode_latencies": metrics.decode_latencies,
                 "total_latency": metrics.total_latency
             }
