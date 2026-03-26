@@ -25,7 +25,7 @@ def main():
             block_size=16,
         )
 
-        llm_service = LLMService(engine_args=engine_args)
+        llm_service = LLMService.from_engine_args(engine_args)
         print(f"✅ Model loaded successfully on device: {llm_service.device}")
         
         # Create sampling config

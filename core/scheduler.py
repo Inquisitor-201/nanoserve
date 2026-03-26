@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .block_manager import BlockManager
-from .config import SamplingConfig, ModelConfig, EngineArgs
+from .config import SamplingConfig, ModelConfig, SchedulerConfig
 
 
 logger = logging.getLogger(__name__)
@@ -64,21 +64,18 @@ class SchedulerOutput(NamedTuple):
 class Scheduler:
     def __init__(
         self,
+        scheduler_config: SchedulerConfig,
         block_manager: BlockManager,
-        model_config: Optional[ModelConfig] = None,
-        engine_args: Optional[EngineArgs] = None,
     ):
         """
         Initialize Scheduler with config-based parameters.
         
         Args:
+            scheduler_config: SchedulerConfig containing scheduling parameters
             block_manager: BlockManager instance for KV cache allocation
-            model_config: ModelConfig containing model structure parameters (optional for backward compatibility)
-            engine_args: EngineArgs containing resource allocation parameters (optional for backward compatibility)
         """
+        self.scheduler_config = scheduler_config
         self.block_manager = block_manager
-        self.model_config = model_config
-        self.engine_args = engine_args
         self.waiting_list: Deque[Request] = deque()
         self.running_list: Deque[Request] = deque()
         self.completed_requests: Dict[str, Request] = {}

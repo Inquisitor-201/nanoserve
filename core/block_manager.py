@@ -12,11 +12,14 @@ using dedicated CUDA operators, not by this class.
 """
 
 import torch
+import logging
 from typing import List, Deque
 from collections import deque
 import threading
 
-from .config import ModelConfig, EngineArgs
+from .config import ModelConfig, CacheConfig
+
+logger = logging.getLogger(__name__)
 
 
 class BlockManager:
@@ -30,36 +33,28 @@ class BlockManager:
     def __init__(
         self,
         model_config: ModelConfig,
-        engine_args: EngineArgs,
+        cache_config: CacheConfig,
     ):
         """
         Initialize BlockManager with pre-allocated KV cache pool.
         
         Args:
             model_config: ModelConfig containing model structure parameters
-            engine_args: EngineArgs containing resource allocation parameters
+            cache_config: CacheConfig containing cache management parameters
         """
-        self.num_blocks = engine_args.num_blocks
-        num_layers = model_config.num_layers
-        num_key_value_heads = model_config.num_key_value_heads
-        head_dim = model_config.head_dim
-        block_size = engine_args.block_size
-        dtype = model_config.dtype
-        device = engine_args.device
+        self.num_blocks = cache_config.num_blocks
+        self.block_size = cache_config.block_size
+        self.device = cache_config.device
         
-        self._validate_block_size_consistency(block_size, model_config.page_size)
-        
-        self.num_layers = num_layers
-        self.num_key_value_heads = num_key_value_heads
-        self.head_dim = head_dim
-        self.block_size = block_size
-        self.dtype = dtype
-        self.device = device
-        
-        self.kv_cache_pool = torch.zeros(
-            (num_layers, self.num_blocks, 2, block_size, num_key_value_heads, head_dim),
-            dtype=dtype,
-            device=device
+        self.num_layers = model_config.num_layers
+        self.num_kv_heads = model_config.num_key_value_heads
+        self.head_dim = model_config.head_dim
+        self.dtype = model_config.dtype
+
+        self.kv_cache_pool = torch.empty(
+            (self.num_layers, self.num_blocks, 2, self.block_size, self.num_kv_heads, self.head_dim),
+            dtype=self.dtype,
+            device=self.device
         )
         
         self._free_blocks: Deque[int] = deque(range(self.num_blocks))
@@ -67,17 +62,9 @@ class BlockManager:
         self._lock = threading.Lock()
         
         logger.info(f"BlockManager initialized: num_blocks={self.num_blocks}, "
-                   f"block_size={block_size}, num_layers={num_layers}, "
-                   f"num_kv_heads={num_key_value_heads}, head_dim={head_dim}")
+                   f"block_size={self.block_size}, num_layers={self.num_layers}, "
+                   f"num_kv_heads={self.num_kv_heads}, head_dim={self.head_dim}")
 
-    def _validate_block_size_consistency(self, engine_block_size: int, model_page_size: int) -> None:
-        if engine_block_size != model_page_size:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning(
-                f"Block size mismatch: EngineArgs.block_size={engine_block_size}, "
-                f"ModelConfig.page_size={model_page_size}. Using engine_args.block_size={engine_block_size}."
-            )
 
     def allocate_blocks(self, current_blocks: List[int], target_num_tokens: int) -> List[int]:
         """

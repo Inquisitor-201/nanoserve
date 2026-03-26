@@ -13,7 +13,7 @@ from .backends import AttentionMetadata, FlashInferBackend
 from .models import Qwen3Model
 from .block_manager import BlockManager
 from .model_loader import ModelLoader
-from .config import ModelConfig, EngineArgs
+from .config import ModelConfig, CacheConfig
 
 
 logger = logging.getLogger(__name__)
@@ -31,28 +31,32 @@ class ModelExecutor:
     def __init__(
         self,
         model_config: ModelConfig,
-        engine_args: EngineArgs,
+        cache_config: CacheConfig,
+        kv_cache_pool: torch.Tensor,
         model_name: str = "qwen3",
+        model_path: str = "",
+        attention_backend: str = "flashinfer",
     ):
         """
         Initialize model executor with config-based parameters.
         
         Args:
             model_config: ModelConfig containing model structure parameters
-            engine_args: EngineArgs containing resource allocation parameters
+            cache_config: CacheConfig containing cache management parameters
+            kv_cache_pool: KV cache pool tensor
             model_name: Name of the model architecture
+            model_path: Path to the model weights
+            attention_backend: Attention backend type
         """
         self.model_name = model_name
-        self.device = engine_args.device
+        self.device = cache_config.device
         self.dtype = model_config.dtype
-        self.block_size = engine_args.block_size
+        self.block_size = cache_config.block_size
         self.model_config = model_config
-        self.engine_args = engine_args
-        
-        self.block_manager = BlockManager(
-            model_config=model_config,
-            engine_args=engine_args
-        )
+        self.cache_config = cache_config
+        self.model_path = model_path
+        self.attention_backend = attention_backend
+        self.kv_cache_pool = kv_cache_pool
 
         if model_name == "qwen3":
             vocab_size = model_config.vocab_size
@@ -71,18 +75,18 @@ class ModelExecutor:
                 head_dim=head_dim,
                 intermediate_size=intermediate_size,
                 num_layers=num_layers,
-                attention_backend_type=engine_args.attention_backend,
+                attention_backend_type=attention_backend,
                 dtype=self.dtype,
                 device=self.device,
-                kv_cache_pool=self.block_manager.kv_cache_pool,
+                kv_cache_pool=self.kv_cache_pool,
                 rope_theta=model_config.rope_theta,
-                block_size=engine_args.block_size
+                block_size=cache_config.block_size
             )
             
-            if engine_args.model_path:
+            if model_path:
                 ModelLoader.load_weights(
                     self.model, 
-                    engine_args.model_path, 
+                    model_path, 
                     self.dtype, 
                     self.device
                 )

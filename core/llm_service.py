@@ -11,7 +11,7 @@ from transformers import AutoTokenizer
 from .model_executor import ModelExecutor
 from .block_manager import BlockManager
 from .scheduler import Scheduler, Request
-from .config import SamplingConfig, ModelConfig, EngineArgs
+from .config import SamplingConfig, ModelConfig, EngineArgs, CacheConfig, SchedulerConfig
 
 
 logger = logging.getLogger(__name__)
@@ -19,84 +19,84 @@ logger = logging.getLogger(__name__)
 
 class LLMService:
     """
-    LLM Service providing unified interface for Qwen3 model loading and inference.
-    
-    This service layer handles:
-    - Model loading and configuration
-    - KV cache management
-    - Inference execution with FlashInfer backend
-    
-    The LLMService only receives EngineArgs in its constructor and internally
-    initializes ModelConfig from HuggingFace config, distributing both to
-    sub-components for a single source of truth architecture.
+    NanoServe core service class.
+    No longer responsible for "producing" configurations, only for "holding" configurations and driving components.
     """
     
     def __init__(
         self,
-        engine_args: EngineArgs,
-        model_config: Optional[ModelConfig] = None,
-    ):
-        """
-        Initialize LLM Service with EngineArgs.
+        model_config: ModelConfig,
+        cache_config: CacheConfig,
+        scheduler_config: SchedulerConfig,
+        model_path: str,
+        attention_backend: str = "flashinfer",
+    ) -> None:
+        # At this point, Configs are already fully determined "finished products"
+        self.model_config = model_config
+        self.cache_config = cache_config
+        self.scheduler_config = scheduler_config
+        self.model_path = model_path
+        self.device = cache_config.device
         
-        Args:
-            engine_args: EngineArgs containing model_path and resource allocation parameters
-            model_config: Optional ModelConfig for overriding defaults (recommended to use EngineArgs only)
-        """
-        self.engine_args = engine_args
-        self.device = engine_args.device if torch.cuda.is_available() else "cpu"
-        self.model_executor: Optional[ModelExecutor] = None
-        self.block_manager: Optional[BlockManager] = None
-        self.scheduler: Optional[Scheduler] = None
-        self.tokenizer: Optional[AutoTokenizer] = None
-        self.model_config: Optional[ModelConfig] = None
-        self._model_path = engine_args.model_path
-        
-        self._load_model()
-
-    def _load_model(self) -> None:
-        """
-        Load Qwen3 model with config-based parameters.
-        
-        ModelConfig is automatically created from HuggingFace config.json,
-        ensuring complete match with model weights.
-        """
-        logger.info(f"Loading Qwen3 model from {self._model_path}")
-        
-        self.tokenizer = AutoTokenizer.from_pretrained(self._model_path)
-        
+        # 1. Initialize Tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         logger.info(f"EOS token ID: {self.eos_token_id}")
         
-        # Create ModelConfig: HuggingFace provides model structure, EngineArgs provides resource params
-        self.model_config = ModelConfig.from_hf_config(
-            model_path=self._model_path,
-            num_blocks=self.engine_args.num_blocks,
-            page_size=self.engine_args.block_size,
-            rope_theta=1000000.0,
-            dtype=self.engine_args.dtype,
-            override_config=model_config,
+        # 2. 生产管家 (BlockManager)
+        # BlockManager 在这里创建并分配显存池
+        self.block_manager = BlockManager(
+            model_config=model_config,
+            cache_config=cache_config
         )
         
-        logger.info(f"ModelConfig created: hidden_size={self.model_config.hidden_size}, "
-                   f"num_heads={self.model_config.num_heads}, "
-                   f"num_layers={self.model_config.num_layers}")
-        
+        # 3. 生产执行器 (ModelExecutor)
+        # 将 BlockManager 的池子传进去
         self.model_executor = ModelExecutor(
-            model_config=self.model_config,
-            engine_args=self.engine_args,
-            model_name="qwen3"
+            model_config=model_config,
+            cache_config=cache_config,
+            kv_cache_pool=self.block_manager.kv_cache_pool,
+            model_path=model_path,
+            attention_backend=attention_backend
         )
         
-        self.block_manager = self.model_executor.block_manager
-        
-        self.scheduler = Scheduler(
-            block_manager=self.block_manager,
-            model_config=self.model_config,
-            engine_args=self.engine_args
+        # 4. 生产调度器
+        # 将 BlockManager 传给它用于请求调度
+        self.scheduler = Scheduler(scheduler_config, self.block_manager)
+    @classmethod
+    def from_engine_args(cls, engine_args: EngineArgs) -> "LLMService":
+        """
+        Factory method: This is the user's only entry point.
+        Here we complete HF Config reading, parameter merging, and validation.
+        """
+        # 1. Core: Load and parse ModelConfig from HF
+        # This handles all parts that "must be read from huggingface config"
+        model_config = ModelConfig.from_hf(
+            model_path=engine_args.model_path,
+            dtype=engine_args.dtype
         )
-        
-        logger.info("Successfully loaded Qwen3 model with config-based initialization")
+
+        # 2. Core: Construct CacheConfig
+        # This handles parts "passed in by the user (such as block_size)"
+        cache_config = CacheConfig(
+            num_blocks=engine_args.num_blocks,
+            block_size=engine_args.block_size,
+            device=engine_args.device
+        )
+
+        # 3. Core: Construct SchedulerConfig
+        scheduler_config = SchedulerConfig(
+            max_num_seqs=engine_args.max_num_seqs
+        )
+
+        # 4. Final step: Package and pass to __init__
+        return cls(
+            model_config=model_config,
+            cache_config=cache_config,
+            scheduler_config=scheduler_config,
+            model_path=engine_args.model_path,
+            attention_backend=engine_args.attention_backend
+        )
     
     def add_requests(
         self,
@@ -160,7 +160,6 @@ class LLMService:
             request_ids: List of request IDs
             sampling_config: SamplingConfig object
         """
-        step_id = 0
         while self.scheduler.has_unfinished_requests():
             sched_output = self.scheduler.schedule()
             
@@ -177,7 +176,6 @@ class LLMService:
             active_ids = [req.request_id for req in sched_output.scheduled_requests]
             
             self.scheduler.update_running_requests(new_tokens, active_ids)
-            step_id += 1
         # 4. Final output collection
         return self._collect_results(request_ids)
 

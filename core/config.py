@@ -31,8 +31,6 @@ class SamplingConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    num_blocks: int = 1000
-    page_size: int = 16
     num_heads: int = 32
     num_key_value_heads: Optional[int] = None
     head_dim: int = 128
@@ -43,15 +41,24 @@ class ModelConfig:
     intermediate_size: Optional[int] = None
     num_layers: Optional[int] = None
 
-    @staticmethod
-    def from_hf_config(
+    @classmethod
+    def from_hf(
+        cls,
         model_path: str,
-        num_blocks: int = 1000,
-        page_size: int = 16,
-        rope_theta: float = 1000000.0,
-        dtype: torch.dtype = torch.bfloat16,
-        override_config: Optional["ModelConfig"] = None,
+        dtype: torch.dtype = torch.bfloat16
     ) -> "ModelConfig":
+        """
+        Load model parameters from HuggingFace configuration.
+        
+        Args:
+            model_path: Model path
+            dtype: Data type
+            
+        Returns:
+            ModelConfig object
+        """
+        from transformers import AutoConfig
+        
         hf_config = AutoConfig.from_pretrained(model_path)
         
         hidden_size = getattr(hf_config, 'hidden_size', 4096)
@@ -61,23 +68,12 @@ class ModelConfig:
         vocab_size = getattr(hf_config, 'vocab_size', 32000)
         intermediate_size = getattr(hf_config, 'intermediate_size', None)
         num_layers = getattr(hf_config, 'num_hidden_layers', None)
+        rope_theta = getattr(hf_config, 'rope_theta', 1000000.0)
         
         if num_key_value_heads is None:
             num_key_value_heads = num_heads
         
-        # Apply user overrides if provided
-        if override_config is not None:
-            num_blocks = override_config.num_blocks if override_config.num_blocks != 1000 else num_blocks
-            page_size = override_config.page_size if override_config.page_size != 16 else page_size
-            num_heads = override_config.num_heads if override_config.num_heads != 32 else num_heads
-            num_key_value_heads = override_config.num_key_value_heads if override_config.num_key_value_heads is not None else num_key_value_heads
-            head_dim = override_config.head_dim if override_config.head_dim != 128 else head_dim
-            hidden_size = override_config.hidden_size if override_config.hidden_size != 4096 else hidden_size
-            rope_theta = override_config.rope_theta
-        
-        return ModelConfig(
-            num_blocks=num_blocks,
-            page_size=page_size,
+        return cls(
             num_heads=num_heads,
             num_key_value_heads=num_key_value_heads,
             head_dim=head_dim,
@@ -91,8 +87,6 @@ class ModelConfig:
 
     def to_dict(self) -> dict:
         return {
-            "num_blocks": self.num_blocks,
-            "page_size": self.page_size,
             "num_heads": self.num_heads,
             "num_key_value_heads": self.num_key_value_heads,
             "head_dim": self.head_dim,
@@ -110,6 +104,38 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class CacheConfig:
+    num_blocks: int = 1000
+    block_size: int = 16
+    device: str = "cuda"
+
+    def to_dict(self) -> dict:
+        return {
+            "num_blocks": self.num_blocks,
+            "block_size": self.block_size,
+            "device": self.device,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CacheConfig":
+        return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})
+
+
+@dataclass(frozen=True)
+class SchedulerConfig:
+    max_num_seqs: int = 256
+
+    def to_dict(self) -> dict:
+        return {
+            "max_num_seqs": self.max_num_seqs,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SchedulerConfig":
+        return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})
+
+
+@dataclass(frozen=True)
 class EngineArgs:
     model_path: str
     device: str = "cuda"
@@ -122,6 +148,48 @@ class EngineArgs:
     def __post_init__(self):
         if not Path(self.model_path).exists():
             raise ValueError(f"Model path does not exist: {self.model_path}")
+
+    def create_engine_configs(self):
+        """Create engine configs from EngineArgs."""
+        from transformers import AutoConfig
+        
+        hf_config = AutoConfig.from_pretrained(self.model_path)
+        
+        hidden_size = getattr(hf_config, 'hidden_size', 4096)
+        num_heads = getattr(hf_config, 'num_attention_heads', 32)
+        num_key_value_heads = getattr(hf_config, 'num_key_value_heads', None)
+        head_dim = getattr(hf_config, 'head_dim', hidden_size // num_heads)
+        vocab_size = getattr(hf_config, 'vocab_size', 32000)
+        intermediate_size = getattr(hf_config, 'intermediate_size', None)
+        num_layers = getattr(hf_config, 'num_hidden_layers', None)
+        rope_theta = getattr(hf_config, 'rope_theta', 1000000.0)
+        
+        if num_key_value_heads is None:
+            num_key_value_heads = num_heads
+        
+        model_config = ModelConfig(
+            num_heads=num_heads,
+            num_key_value_heads=num_key_value_heads,
+            head_dim=head_dim,
+            hidden_size=hidden_size,
+            rope_theta=rope_theta,
+            dtype=self.dtype,
+            vocab_size=vocab_size,
+            intermediate_size=intermediate_size,
+            num_layers=num_layers,
+        )
+        
+        cache_config = CacheConfig(
+            num_blocks=self.num_blocks,
+            block_size=self.block_size,
+            device=self.device,
+        )
+        
+        scheduler_config = SchedulerConfig(
+            max_num_seqs=self.max_num_seqs,
+        )
+        
+        return model_config, cache_config, scheduler_config
 
     def to_dict(self) -> dict:
         return {
