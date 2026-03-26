@@ -4,8 +4,8 @@ Simple example demonstrating text generation with Qwen3 model.
 """
 
 import logging
-import torch
-from core import LLMService, SamplingConfig, ModelConfig, EngineArgs
+import time
+from core import LLMService, SamplingConfig, EngineArgs
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -42,11 +42,25 @@ def main():
                    "你是一个精通逻辑推理的数学助手。在回答任何数学问题之前，你必须遵循以下步骤：1. 提取题目中的关键数字和条件；2. 分步骤列出计算过程，每一步只做一个简单的运算；3. 最后给出最终结果。请务必保持逻辑严密，不要跳步。请你计算：小红买了3个苹果，单价12元；又买了2个梨，单价16元。她给了老板68元，应该找回多少钱？"]
         
         print(f"Input: {prompts}")
+
+        
+        start_time = time.perf_counter()
         generated_texts = llm_service.generate(
             prompts=prompts,
             sampling_config=sampling_config,
         )
+        end_time = time.perf_counter()
+        total_time = end_time - start_time
+        print(f"Total time: {total_time:.4f} seconds")
         
+        # Get actual token counts from profiling statistics
+        stats = llm_service.get_stats()
+        actual_total_tokens = sum(req_stats.get('total_tokens', 0) for req_stats in stats.values())
+        actual_tokens_per_second = actual_total_tokens / total_time if total_time > 0 else 0
+        
+        print(f"Actual token count: {actual_total_tokens}")
+        print(f"Tokens per second: {actual_tokens_per_second:.2f} tokens/s" if actual_tokens_per_second > 0 else "N/A")
+
         print(f"\n✅ Generated text:")
         for i, (prompt, generated) in enumerate(zip(prompts, generated_texts)):
             print(f"  {i+1}. '{prompt}' -> '{generated}'")
