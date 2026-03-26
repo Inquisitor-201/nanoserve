@@ -1,5 +1,18 @@
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+
+# Cache
+.cache/
+
+# Environment
+.env
 .venv
-*.pyc
-*.pyo
-models
+
+# IDE
+.vscode/
+.idea/
+
+# Models directory (if used locally)
+models/
