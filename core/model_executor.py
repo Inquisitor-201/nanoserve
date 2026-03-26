@@ -14,6 +14,7 @@ from .models import Qwen3Model
 from .block_manager import BlockManager
 from .model_loader import ModelLoader
 from .config import ModelConfig, CacheConfig
+from .utils import StatsCollector, ProfileTimer
 
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ class ModelExecutor:
         self.model_path = model_path
         self.attention_backend = attention_backend
         self.kv_cache_pool = kv_cache_pool
+        self.stats = StatsCollector()
 
         if model_name == "qwen3":
             vocab_size = model_config.vocab_size
@@ -126,8 +128,9 @@ class ModelExecutor:
             device=self.device
         )
         
-        # Execute model forward pass
-        logits = self.model(input_ids, metadata)
+        # Execute model forward pass with profiling
+        with ProfileTimer(self.stats, is_prefill):
+            logits = self.model(input_ids, metadata)
         
         return logits
 
@@ -245,3 +248,19 @@ class ModelExecutor:
         next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
         
         return next_tokens
+    def get_stats(self) -> Dict[str, Any]:
+        """Get profiling statistics."""
+        return self.stats.get_stats()
+    def reset_stats(self) -> None:
+        """Reset profiling statistics."""
+        self.stats = StatsCollector()
+    def get_model_info(self) -> Dict[str, Any]:
+        """Get model information."""
+        return {
+            "model_name": self.model_name,
+            "hidden_size": self.model_config.hidden_size,
+            "num_heads": self.model_config.num_heads,
+            "num_layers": self.model_config.num_layers,
+            "dtype": str(self.dtype),
+            "device": str(self.device)
+        }

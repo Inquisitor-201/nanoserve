@@ -17,6 +17,7 @@ import torch
 from dataclasses import dataclass
 from enum import Enum
 
+import time
 from .block_manager import BlockManager
 from .config import SamplingConfig, ModelConfig, SchedulerConfig
 
@@ -29,6 +30,26 @@ class RequestState(Enum):
     PREEMPTED = "preempted" 
 
 @dataclass
+class RequestMetrics:
+    """专门负责记录请求的性能画像"""
+    arrival_time: float = 0.0
+    start_inference_time: float = None
+    ttft: float = 0.0
+    decode_latencies: List[float] = None
+    
+    def __post_init__(self):
+        if self.decode_latencies is None:
+            self.decode_latencies = []
+        if self.arrival_time == 0.0:
+            self.arrival_time = time.perf_counter()
+    
+    @property
+    def total_latency(self) -> float:
+        if self.start_inference_time is None:
+            return 0.0
+        return time.perf_counter() - self.arrival_time
+
+@dataclass
 class Request:
     request_id: str
     input_ids: torch.Tensor
@@ -39,10 +60,19 @@ class Request:
     state: RequestState = RequestState.WAITING
     generated_tokens: List[int] = None
     eos_token_id: int = 2
+    # 将 Profile 数据收拢到一个对象里
+    metrics: RequestMetrics = None
     
     def __post_init__(self):
         if self.generated_tokens is None:
             self.generated_tokens = []
+        if self.metrics is None:
+            self.metrics = RequestMetrics()
+    
+    @property
+    def is_prefill(self):
+        # 如果还没产生过任何生成的 token，说明还没做完 prefill
+        return len(self.generated_tokens) == 0
     
     def is_finished(self) -> bool:
         if self.generated_tokens and self.generated_tokens[-1] == self.eos_token_id:

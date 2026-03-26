@@ -51,6 +51,21 @@ def main():
         for i, (prompt, generated) in enumerate(zip(prompts, generated_texts)):
             print(f"  {i+1}. '{prompt}' -> '{generated}'")
         
+        # Print profiling statistics
+        stats = llm_service.get_stats()
+        print("\n📊 Profiling Statistics:")
+        print("  Request-level statistics:")
+        for req_id, req_stats in stats.items():
+            print(f"    Request {req_id}:")
+            print(f"      TTFT: {req_stats.get('ttft', 0):.4f} seconds")
+            print(f"      Avg ITL: {req_stats.get('avg_itl', 0):.4f} seconds")
+            print(f"      Total Tokens: {req_stats.get('total_tokens', 0)}")
+            print(f"      Total Latency: {req_stats.get('total_latency', 0):.4f} seconds")
+            if req_stats.get('total_tokens', 0) > 0:
+                total_time = req_stats.get('ttft', 0) + sum(req_stats.get('decode_latencies', []))
+                tokens_per_second = req_stats.get('total_tokens', 0) / total_time if total_time > 0 else 0
+                print(f"      Tokens per Second: {tokens_per_second:.2f} tokens/s")
+        
         print("\n🎉 Text generation completed!")
         
     except Exception as e:

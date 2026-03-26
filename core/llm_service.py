@@ -12,6 +12,7 @@ from .model_executor import ModelExecutor
 from .block_manager import BlockManager
 from .scheduler import Scheduler, Request
 from .config import SamplingConfig, ModelConfig, EngineArgs, CacheConfig, SchedulerConfig
+from .utils import ContinuousBatchTimer
 
 
 logger = logging.getLogger(__name__)
@@ -183,12 +184,14 @@ class LLMService:
         """Unified inference step handling both Prefill and Decode."""
         is_prefill = sched_output.is_prefill
         
-        logits = self.model_executor.execute_batch(
-            input_ids=sched_output.input_ids,
-            block_tables=sched_output.block_tables,
-            seq_lengths=sched_output.seq_lengths,
-            is_prefill=is_prefill
-        )
+        # Use ContinuousBatchTimer for profiling
+        with ContinuousBatchTimer(sched_output.scheduled_requests):
+            logits = self.model_executor.execute_batch(
+                input_ids=sched_output.input_ids,
+                block_tables=sched_output.block_tables,
+                seq_lengths=sched_output.seq_lengths,
+                is_prefill=is_prefill
+            )
 
         if is_prefill:
             indices = torch.cumsum(
@@ -302,6 +305,24 @@ class LLMService:
         info["model_name"] = "qwen3"
         return info
     
+    def get_stats(self) -> Dict[str, Any]:
+        """Get profiling statistics for all requests."""
+        stats = {}
+        for req_id, req in self.scheduler.completed_requests.items():
+            metrics = req.metrics
+            avg_itl = sum(metrics.decode_latencies) / len(metrics.decode_latencies) if metrics.decode_latencies else 0
+            stats[req_id] = {
+                "ttft": metrics.ttft,
+                "avg_itl": avg_itl,
+                "total_tokens": len(req.generated_tokens),
+                "decode_latencies": metrics.decode_latencies,
+                "total_latency": metrics.total_latency
+            }
+        return stats
+    def reset_stats(self) -> None:
+        """Reset profiling statistics."""
+        if self.model_executor:
+            self.model_executor.reset_stats()
     def __repr__(self) -> str:
         status = "qwen3_loaded" if self.model_executor else "no_model"
         return f"LLMService(device={self.device}, {status})"
