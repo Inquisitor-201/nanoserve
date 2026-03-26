@@ -13,6 +13,10 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+.trae/
 
 # Models directory (if used locally)
 models/
+
+build/
+*.egg-info
