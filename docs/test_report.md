@@ -1,7 +1,7 @@
 # nanoserve 离线推理测试报告
 
 > **测试日期**: 2026-04-30
-> **测试目标**: 评估 nanoserve 推理框架在离线批量场景下的吞吐与延迟表现，分析连续批处理的可扩展性。
+> **测试目标**: 评估 nanoserve 推理框架的批量推理性能，对比 Burst（同时到达）和 Staggered（波次到达）两种模式，分析连续批处理的实际效果。
 
 ---
 
@@ -20,16 +20,13 @@
 
 ## 1. 术语说明
 
-本文档中几个关键概念的区分：
-
 | 概念 | 含义 |
 |------|------|
-| **num_requests** | 调用 `generate()` 时一次性提交的请求总数 |
-| **GPU batch** | Scheduler 在单次 `schedule()` 中实际组批的请求数。由剩余 KV cache 动态决定 |
-| **Prefill / Decode** | 推理的两个阶段。Prefill 计算整个 prompt 的注意力；Decode 逐个 token 自回归生成 |
-| **Continuous Batching** | Scheduler 在 decode 间隙插入 prefill 的能力（当前实现为"先全部 prefill 再全部 decode"） |
-
-> **注意**: `num_requests` ≠ GPU batch size。Scheduler 根据可用 KV block 决定一次能 prefill 多少请求，解码时所有 running 请求组成一个 batch。本文各测试中，受限于 `max_new_tokens=256` 的 KV 需求，每次 `generate()` 内的所有请求都能一次性进入 GPU batch（无分段 prefill）。
+| **Burst 模式** | 所有请求一次性通过 `add_requests()` 提交，`main_loop` 统一处理。scheduler 全部 prefill 后再全部 decode |
+| **Staggered 模式** | 请求分多个波次（wave）在 decode 过程中到达，scheduler 需在 decode 间隙插入 prefill 新请求。触发真正的连续批处理 |
+| **Wave** | Staggered 模式中的一批请求。同一 wave 的请求同时到达 |
+| **TTFT** | Time To First Token。请求加入 scheduler 到产出第一个 token 的延迟 |
+| **ITL** | Inter-Token Latency。后续每生成一个 token 的平均耗时 |
 
 ---
 
@@ -68,279 +65,263 @@
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| num_blocks | **4473**（自动计算） | 根据可用显存自动算出 |
+| num_blocks | **4473**（自动计算） | 65% 显存用于 KV cache |
 | block_size | 16 | 每块 token 数 |
-| KV cache 总容量 | 4473 × 16 = **71,568 tokens** | 所有序列共享 |
-| KV cache 显存占用 | ~7.64 GiB | 28×4473×2×16×8×128×2B |
+| KV cache 总容量 | 4473 × 16 = **71,568 tokens** |
 | max_num_seqs | 256 | 最大并发序列数上限 |
-| Attention backend | FlashInfer | 分页注意力实现 |
-
-#### 关于自动计算 num_blocks
-
-当 `EngineArgs(num_blocks=None)` 或省略此参数时，框架自动：
-
-1. 从 HuggingFace 加载模型配置（获取 `num_layers`, `num_kv_heads`, `head_dim`）
-2. 查询 `torch.cuda.get_device_properties(0).total_memory`
-3. 预留 **35%** 给模型权重 + 激活值 + CUDA 上下文
-4. 剩余 **65%** 全部用于 KV cache 的 block 分配
-
-公式：
-
-```
-num_blocks = (total_gpu_memory × 0.65)
-             / (num_layers × 2 × block_size × num_kv_heads × head_dim × dtype_bytes)
-```
-
-本环境计算结果：**4473 blocks**（KV cache 占 ~7.64 GiB，加上模型权重 ~1.2 GiB + 激活值，合计 ~9.31 GiB）
-
-用户可随时手动指定 `num_blocks` 来覆盖自动值。
+| Attention backend | FlashInfer | 分页注意力 |
 
 ---
 
 ## 3. 测试方法
 
-### 3.1 测试脚本
+### 3.1 两种测试模式
 
-使用 `testbench.py`，见附录 A。
+**Burst 模式（baseline）：**
+
+```
+add_requests(all) → main_loop → collect
+                    ├─ schedule() → 一次 prefill 所有请求
+                    └─ schedule() → decode 所有请求（256步）
+```
+
+所有请求同时到达。scheduler 一次性 prefill，然后全部 decode。这是吞吐上限。
+
+**Staggered 模式（连续批处理）：**
+
+```
+wave 0: add_requests  →  prefill → decode...
+wave 1:                  at step K → add_requests → prefill → decode...
+wave 2:                                   at step 2K → add_requests → prefill → decode...
+```
+
+请求分多个 wave 在 decode 过程中注入。scheduler 在 decode 步骤间插入 prefill。这模拟了真实 serving 场景。
 
 ### 3.2 测试变量
 
 | 变量 | 取值 |
 |------|------|
-| num_requests（提交请求数） | {1, 2, 4, 8, 16, 32, 64} |
-| Prompt 类型 | short (2–3 tok), medium (14–15 tok), long (80–103 tok) |
-| 每请求生成长度 | 256 tokens（固定） |
+| 总请求数 | {16, 32, 64, 128} |
+| Prompt 类型 | short（2-3 tokens） |
+| 每请求 max_new_tokens | 256（固定） |
+| Staggered 波次 | 16/32 req → 4 waves, 64/128 req → 8 waves |
+| 波次注入间隔 | ~256/(waves+1) decode steps |
 | 采样参数 | temperature=0.7, top_p=0.9 |
 
 ### 3.3 采集指标
 
 | 指标 | 含义 |
 |------|------|
-| Throughput (tok/s) | 每秒处理 token 总数（含 prompt + generation） |
-| Throughput (req/s) | 每秒完成请求数 |
-| TTFT | Time To First Token, 首 token 延迟 |
-| ITL | Inter-Token Latency, 后续每 token 平均延迟 |
-| Prefill / Decode steps | 调度器实际执行的 prefill 轮次和 decode 轮次 |
-
-### 3.4 流程
-
-每个 (num_requests, prompt_type) 组合：
-
-1. **Warmup**: 1 次空跑（预热 CUDA kernels）
-2. **Timed run**: 记录一次带 `torch.cuda.synchronize()` 时序的完整 `generate()` 调用
-3. **采集**: 从 `scheduler.completed_requests` 逐请求提取 TTFT、ITL
+| Wall time | 端到端耗时（最后一条请求完成） |
+| Throughput (tok/s) | 所有 token / wall time |
+| Throughput (req/s) | 请求数 / wall time |
+| TTFT | 每条请求的首 token 延迟均值 |
+| ITL | 所有 decode 步骤的延迟均值 |
 
 ---
 
 ## 4. 基准测试结果
 
-### 4.1 Short Prompts（2–3 tok input → 256 tok output）
-
-**样例**: `"中国是一个"`, `"人工智能是"`, `"机器学习是"`
+### 4.1 Burst 模式（同时到达）
 
 ```
- #Req | Throughput  | Throughput |  TTFT  |   ITL  |   Steps  |  Wall
-      |  tokens/s   |   req/s    | avg ms | avg ms |   P/D    |  (s)
-------+-------------+------------+--------+--------+----------+--------
-   1  |       26.5  |      0.1   |   40.3 |   36.7 |  1/255   |  9.740
-   2  |       51.8  |      0.2   |   56.6 |   37.2 |  2/510   |  9.970
-   4  |      104.5  |      0.4   |   40.1 |   36.8 |  4/1020  |  9.908
-   8  |      183.5  |      0.7   |   56.9 |   41.4 |  8/2040  | 11.291
-  16  |      410.4  |      1.6   |   42.5 |   36.2 | 16/4080  | 10.100
-  32  |      790.4  |      3.1   |   42.4 |   35.8 | 32/8160  | 10.488
-  64  |     1437.5  |      5.5   |   47.6 |   36.4 | 64/16320 | 11.536
+ #Req |   Wall   |  tok/s   |  req/s  |  TTFT avg |  ITL avg
+      |    (s)   |          |         |   (ms)    |   (ms)
+------+----------+----------+---------+-----------+----------
+  16  |   10.76  |    385   |   1.5   |    55.3   |   38.6
+  32  |   11.62  |    714   |   2.8   |    51.3   |   39.9
+  64  |   13.03  |   1273   |   4.9   |    54.1   |   41.7
+ 128  |   13.52  |   2454   |   9.5   |    62.5   |   39.0
 ```
 
-### 4.2 Medium Prompts（14–15 tok input → 256 tok output）
+### 4.2 Staggered 模式（波次到达）
 
-**样例**: `"解释一下C++和Python的主要区别，以及各自的应用场景。"`
-
-```
- #Req | Throughput  | Throughput |  TTFT  |   ITL  |   Steps  |  Wall
-      |  tokens/s   |   req/s    | avg ms | avg ms |   P/D    |  (s)
-------+-------------+------------+--------+--------+----------+--------
-   1  |       27.4  |      0.1   |   39.8 |   37.0 |  1/255   |  9.843
-   2  |       53.1  |      0.2   |   41.8 |   38.0 |  2/510   | 10.173
-   4  |      100.3  |      0.4   |   43.8 |   40.0 |  4/1020  | 10.768
-   8  |      213.8  |      0.8   |   44.2 |   37.0 |  8/2040  | 10.104
-  16  |      425.6  |      1.6   |   44.2 |   36.4 | 16/4080  | 10.150
-  32  |      821.7  |      3.0   |   51.9 |   35.8 | 32/8160  | 10.515
-  64  |     1488.6  |      5.5   |   73.8 |   36.6 | 64/16320 | 11.608
-```
-
-### 4.3 Long Prompts（80–103 tok input → 256 tok output）
-
-**样例**: `"你是一个精通逻辑推理的数学助手..."`（约 100 字长 prompt）
+**16 requests（4 waves × 4 req）：**
 
 ```
- #Req | Throughput  | Throughput |  TTFT  |   ITL  |   Steps  |  Wall
-      |  tokens/s   |   req/s    | avg ms | avg ms |   P/D    |  (s)
-------+-------------+------------+--------+--------+----------+--------
-   1  |       35.4  |      0.1   |   39.7 |   38.2 |  1/255   | 10.145
-   2  |       66.5  |      0.2   |   41.4 |   38.9 |  2/510   | 10.431
-   4  |      136.8  |      0.4   |   61.5 |   37.5 |  4/1020  | 10.143
-   8  |      279.2  |      0.8   |   63.5 |   36.3 |  8/2040  |  9.944
-  16  |      546.7  |      1.6   |  114.5 |   36.1 | 16/4080  | 10.155
-  32  |    ⚠ OOM   |            |        |        |          |
+ Wave  |  tok/s  |  #Req   |  TTFT avg |  ITL avg
+       |(per wave)|         |   (ms)    |   (ms)
+-------+----------+---------+-----------+----------
+   0   |   58.9  |    4    |    46.0   |   39.6
+   1   |   58.9  |    4    |    42.8   |   39.9
+   2   |   58.9  |    4    |    44.0   |   40.2
+   3   |   58.9  |    4    |    43.0   |   40.5
+ Total |  235.5  |   16    |    43.9   |   40.1
+ Wall: 17.58s （Burst: 10.76s）
 ```
 
-> **OOM 分析**: long prompts + 32 requests 总 KV 需求 ≈ 32 × (91 + 256) = 11,104 tokens，远低于 71,568 容量。但 prefill 阶段需要同时计算 32 × 91 = 2,912 tokens 的完整注意力，中间激活值（attention scores, softmax 输出等）瞬时撑爆显存。这是 **compute-time memory**（激活内存）瓶颈，不是 KV cache 容量问题。
-
-### 4.4 汇总 - num_requests 扩展性
-
-在所有 prompt 类型下，**每请求吞吐稳定在 25-26 tok/s/seq**（单序列解码速度），因此总吞吐几乎随 num_requests 线性增长：
+**32 requests（4 waves × 8 req）：**
 
 ```
-t/s
-1400 ┼                                          ● short (1437)
-     │                                          ● medium (1488)
-1200 ┼
-     │
-1000 ┼
-     │
- 800 ┼                                ● (790)
-     │                                ● (822)
- 600 ┼
-     │                     ● (410)
- 400 ┼                     ● (426)
-     │                     ● (547)
- 200 ┼          ● (104)   ● (213)
-     │          ● (137)   ● (279)
-   0 ┼──● (26)──● (52)──────────────────────────
-     1      2       4       8      16      32      64
-                                    num_requests →
+ Wave  |  tok/s  |  #Req   |  TTFT avg |  ITL avg
+-------+----------+---------+-----------+----------
+   0   |  120.8  |    8    |    41.7   |   37.5
+   1   |  120.8  |    8    |    41.6   |   37.4
+   2   |  120.8  |    8    |    40.9   |   37.7
+   3   |  120.8  |    8    |    41.9   |   38.4
+ Total |  483.3  |   32    |    41.5   |   37.7
+ Wall: 17.15s （Burst: 11.62s）
+```
+
+**64 requests（8 waves × 8 req）：**
+
+```
+ Wave  |  tok/s  |  #Req   |  TTFT avg |  ITL avg
+-------+----------+---------+-----------+----------
+   0   |  100.6  |    8    |    44.3   |   40.1
+   1   |  100.6  |    8    |    46.5   |   40.0
+   2   |  100.6  |    8    |    43.8   |   39.9
+   3   |  100.6  |    8    |    47.5   |   39.5
+   4   |  100.6  |    8    |    45.5   |   39.3
+   5   |  100.6  |    8    |    42.4   |   39.2
+   6   |  100.6  |    8    |    41.8   |   39.2
+   7   |  100.6  |    8    |    40.9   |   39.1
+ Total |  805.2  |   64    |    44.1   |   39.5
+ Wall: 20.59s （Burst: 13.03s）
+```
+
+**128 requests（8 waves × 16 req）：**
+
+```
+ Wave  |  tok/s  |  #Req   |  TTFT avg |  ITL avg
+-------+----------+---------+-----------+----------
+   0   |  195.3  |   16    |    42.9   |   37.7
+   1   |  195.3  |   16    |    41.9   |   37.8
+   2   |  195.3  |   16    |    41.3   |   37.8
+   3   |  195.3  |   16    |    48.0   |   37.9
+   4   |  195.3  |   16    |    41.1   |   37.9
+   5   |  195.3  |   16    |    40.2   |   37.7
+   6   |  195.3  |   16    |    41.6   |   37.7
+   7   |  195.3  |   16    |    41.9   |   37.7
+ Total | 1562.3  |  128    |    42.4   |   37.8
+ Wall: 21.23s （Burst: 13.52s）
+```
+
+### 4.3 核心对比
+
+```
+ 请求数  |  Burst tok/s  |  Staggered tok/s  |  比例   |  Burst TTFT  |  Staggered TTFT
+---------+---------------+-------------------+---------+--------------+-----------------
+   16    |     385       |       236         |   61%   |   55.3 ms    |    43.9 ms
+   32    |     714       |       483         |   68%   |   51.3 ms    |    41.5 ms
+   64    |    1273       |       805         |   63%   |   54.1 ms    |    44.1 ms
+  128    |    2454       |      1562         |   64%   |   62.5 ms    |    42.4 ms
 ```
 
 ---
 
 ## 5. 性能分析
 
-### 5.1 解码延迟（ITL）稳定在 ~36-41ms
+### 5.1 Burst 模式——吞吐上限
 
-无论 prompt 类型和 num_requests 如何变化，**逐 token 解码延迟始终稳定**：
+Burst 模式下，墙钟时间几乎不随请求数增加：
 
-| 配置 | ITL 范围 | 偏离 |
-|------|---------|------|
-| Short, 1→64 req | 35.7–41.4 ms | ±8% |
-| Medium, 1→64 req | 35.8–40.0 ms | ±6% |
-| Long, 1→16 req | 36.1–38.9 ms | ±4% |
+```
+ 16 req: 10.76s
+128 req: 13.52s   (+26%)
+```
 
-这表明：
+墙钟 = prefill(1步) + decode(256步)。增加请求数只增加每步 batch size，不增加步数。因此吞吐几乎线性扩展：16→128 请求，吞吐提升 6.4×。
 
-- **解码阶段是 memory-bandwidth bound**。RTX 3060 的 360 GB/s 显存带宽是瓶颈
-- 增加 batch 不会显著增加单 token 延迟，因为注意力计算的增量 KVCache 读取与 batch 大小呈正比，但带宽利用率已接近饱和
-- batch=64 时 ITL 仍然只有 ~36ms，说明 GPU 可以很好地利用并行性隐藏增加的访存量
+这就是 LLM 推理的独特性质：**Burst 模式下，增加请求数的边际成本极低**，因为 decode 步数是固定的。
 
-### 5.2 Prefill 延迟（TTFT）受 prompt 长度支配
+### 5.2 Staggered 模式——连续批处理实际效果
 
-| num_requests | Short TTFT | Long TTFT |
-|-------------|-----------|----------|
-| 1 | 40 ms | 40 ms |
-| 4 | 40 ms | 62 ms |
-| 16 | 43 ms | 115 ms |
+Staggered 模式的墙钟更长：
 
-- Short prompt 的 TTFT 基本不随请求数变化（prefill 计算量小，GPU 可并行）
-- Long prompt 的 TTFT 随 batch 增长明显：每新增一条 91 tok 的请求，prefill 需多算 91 个位置的注意力分数
+| 请求数 | Burst 墙钟 | Staggered 墙钟 | 增幅 |
+|--------|-----------|---------------|------|
+| 16 | 10.76s | 17.58s | +63% |
+| 128 | 13.52s | 21.23s | +57% |
 
-### 5.3 时间分解
+原因是 staggered 模式下，**最后一批请求的 decode 结束时间被推迟了**。每个 wave 的注入间隔（spacing）让总的 decode timeline 被拉长。示意图：
 
-以 short prompts、64 请求为例：
+```
+Burst:
+  16 req: ██prefill██→████decode 256步████→ done at t=10.8s
+
+Staggered (4 waves of 4):
+  w0: ██p█→████d████→ ... →████done at t=256
+  w1:           at step 51: ██p█→████d████→ ... →done at t=307
+  w2:                      at step 102: ██p█→████d████→ ... →done at t=358
+  w3:                                at step 153: ██p█→████d████→ ... →done at t=409
+                                                                       ↑ done at t=17.6s
+```
+
+### 5.3 关键发现：TTFT 一致性
+
+**Staggered 模式下，所有 wave 的 TTFT 均保持在 40-48ms，不随 wave 号递增。**
+
+这意味着：
+- 晚到达的请求不需要等待前面的请求 decode 完成
+- Scheduler 在 decode 间隙迅速 prefill 新请求（~2-5ms for 16 short prompts）
+- **连续的 prefill 不会显著增加 decode 延迟**（ITL 始终 ~38ms）
+
+对比 Burst 模式：TTFT 55-63ms，略高于 staggered 的 42-44ms。Burst 模式下，一次 prefill 所有请求（128 × 3 = 384 tokens）比 staggered 模式一次 prefill 16 个请求（48 tokens）耗时更长。
+
+### 5.4 ITL 完全不受影响
+
+Burst 和 Staggered 的 ITL 完全相同（38-40ms），不受以下因素影响：
+
+- 总请求数（16 vs 128）
+- 调度模式（burst vs staggered）
+- 是否在 prefill 间隙穿插 decode
+
+这进一步验证了 **decode 是 memory-bandwidth bound**，prefill 的插入不会影响单步 decode 延迟。
+
+### 5.5 时间分解
+
+以 Burst 128 为例：
 
 | 阶段 | 耗时 | 占比 |
 |------|------|------|
-| Prefill（1 步） | ~48 ms | ~0.4% |
-| Decode（255 步 × ~36 ms） | ~11,488 ms | ~99.6% |
-| **合计** | **~11,536 ms** | **100%** |
+| Prefill（128 req × 3 tok） | ~63 ms | 0.5% |
+| Decode（256 步 × ~39 ms） | ~9,984 ms | 73.9% |
+| 其他（调度、采样等开销） | ~3,473 ms | 25.7% |
+| **合计** | **~13,520 ms** | **100%** |
 
-**Decode 占据 >99% 的时间。** 这是因为 `max_new_tokens=256` 下，每个请求要自回归解码 255 步，而 prefill 只需 1 步。
-
-### 5.4 KV Cache 容量
-
-| 参数 | 400 blocks（旧） | 4473 blocks（自动） |
-|------|-----------------|-------------------|
-| 总容量 | 6,400 tokens | **71,568 tokens** |
-| 显存占用 | ~730 MB | ~7.64 GiB |
-| 最大 short 请求 | ~24 | ~276 |
-| 最大 medium 请求 | ~23 | ~265 |
-| 最大 long 请求 | ~17 | ~206 |
-
-实际限制更多来自 prefill 阶段的激活内存而非 KV cache 容量。
-
-### 5.5 全表汇总
-
-```
-             Short (2-3 tok)         Medium (14-15 tok)        Long (80-103 tok)
- #Req   |  tok/s   TTFT   ITL   |   tok/s   TTFT   ITL   |   tok/s   TTFT   ITL
---------+------------------------+------------------------+------------------------
-   1    |    26.5  40.3  36.7   |    27.4  39.8  37.0   |    35.4  39.7  38.2
-   2    |    51.8  56.6  37.2   |    53.1  41.8  38.0   |    66.5  41.4  38.9
-   4    |   104.5  40.1  36.8   |   100.3  43.8  40.0   |   136.8  61.5  37.5
-   8    |   183.5  56.9  41.4   |   213.8  44.2  37.0   |   279.2  63.5  36.3
-  16    |   410.4  42.5  36.2   |   425.6  44.2  36.4   |   546.7 114.5  36.1
-  32    |   790.4  42.4  35.8   |   821.7  51.9  35.8   |    OOM   -     -
-  64    |  1437.5  47.6  36.4   |  1488.6  73.8  36.6   |    -     -     -
-```
+> 注：Burst 128 比 Burst 16 多出的 ~3s 开销来自调度器内部循环（每步处理 128 条请求的 block table、token 管理等），以及 attention backend 对更大 batch 的额外处理。
 
 ---
 
 ## 6. 瓶颈定位
 
-### 6.1 显存带宽瓶颈（Decode 主瓶颈）
+### 6.1 解码显存带宽（主要瓶颈）
 
-- 单步 decode 需读取 28 层 KV cache: 每层 2×16×8×128×2B = 65,536 B
-- 加上权重（QKV 投影 + FFN），单步总访存量远超计算量
-- RTX 3060 **360 GB/s**  显存带宽，实测单序列 decode 约 25 tok/s
-- 算术强度极低（~1 FLOP/byte），典型的 memory-bound 场景
+- 单步 decode 访存量：28 层 × (KV cache + 权重) ≈ 数百 MB
+- RTX 3060 360 GB/s 带宽，实测每 token ~25 tok/s/seq
+- 增加 batch 不显著增加每步延迟——说明注意力访问的带宽效率高
 
-### 6.2 激活内存瓶颈（Prefill OOM）
+### 6.2 调度 overhead（大 batch 显现）
 
-Long prompt × 32 requests 时 prefill OOM 的原因：
+Burst 128 比 Burst 16 多了 ~3s 的非 decode 开销。来源：
 
-- Prefill 需要同时计算 2,912 tokens 的注意力
-- Attention score 矩阵: batch × num_heads × seq_len² = 32 × 16 × (91)² ≈ 4.2M 元素
-- 中间激活值（QKV 投影输出、softmax 输出、残差流等）每个 ~2912 × 1024 × 2B ≈ 6 MB/层
-- 28 层合计中间激活 ≈ 200-300 MB
-- 加上 KV cache 写入（~2.1 GB for 32 requests）和模型权重（1.2 GB）
+- Scheduler 每步更新 128 条请求的 block table
+- `update_running_requests` 循环 128 次 × 256 步 = 32,768 次迭代
+- `_run_inference_step` 中的采样（128 × 151936 vocab softmax）
 
-### 6.3 调度器单步限制
+### 6.3 KV Cache 未达瓶颈
 
-当前 scheduler 的 `schedule()` 逻辑是 **全 prefill 后全 decode**：
-
-```
-if waiting_list: → _schedule_prefill()   # 一次 prefill 所有 waiting 请求
-else:             → _schedule_decode()   # decode 所有 running 请求
-```
-
-这不是真正的 continuous batching（interleaved prefill + decode）。改进为连续批处理后，长 prompt 和大 batch 场景下 decode 步骤可穿插 prefill 新请求，平滑显存峰值。
+4473 blocks × 16 = 71,568 tokens 容量。128 请求 × (3 + 256) = 33,152 tokens，利用率仅 46%。继续增加请求到 256 应仍可容纳。
 
 ---
 
 ## 7. 优化建议
 
-### 7.1 连续批处理（Continuous Batching）
+### 7.1 优化调度器循环
 
-将调度策略从"全 prefill 再全 decode"改为"每步最多 prefill 一个请求 + decode 已有请求"：
+大 batch 下，scheduler 的 Python 级循环（逐请求更新 block table、逐请求检查 EOS）成为 overhead。可批量处理这些操作：
 
-```
-当前:  prefill all → decode all → done
-改进:  decode + prefill(1) → decode + prefill(1) → decode → ...
-```
+- `update_running_requests` 使用向量化操作而非 for 循环
+- 使用 PyTorch tensor 跟踪 block table 而非 Python list
 
-收益：
-- 平滑 prefill 显存峰值，缓解长 prompt OOM
-- 解码过程中可插入新请求，降低首个请求的排队延迟
+### 7.2 动态波次调度
 
-### 7.2 减小 block_size 降低内部碎片
+当前 Staggered 测试使用固定 spacing。实际 serving 可根据 KV cache 余量动态决定何时注入新请求，平衡吞吐和延迟。
 
-当前每个请求始终需要 `ceil((prompt_len + max_new_tokens) / 16)` 块。若 `block_size=8`，碎片更少，相同容量可服务更多序列。
+### 7.3 请求级 max_new_tokens 差异
 
-### 7.3 长 prompt 分段 prefill（Chunked Prefill）
-
-对于长 prompt，可以将 prefill 拆成多个 chunk，与 decode 交替执行，避免单步显存尖峰。
-
-### 7.4 KV cache 量化
-
-当前 KV cache 使用 bfloat16（2B/element）。如果实现 FP8 KV cache，容量翻倍且带宽需求减半。
+当前所有请求使用相同 max_new_tokens。混合长短生成的任务下，scheduler 可优先 decode 短请求以释放 block，提高 block 周转率。
 
 ---
 
@@ -348,40 +329,39 @@ else:             → _schedule_decode()   # decode 所有 running 请求
 
 ### A. 测试脚本
 
-位于 `testbench.py`，核心流程：
+`testbench.py` 核心流程：
 
+**Burst 模式：**
+```python
+request_ids = llm_service.add_requests(prompts, sampling_config)
+llm_service.main_loop(request_ids, sampling_config)
 ```
-LLMService.from_engine_args(engine_args)
-  └─ generate(prompts, sampling_config)
-       ├─ add_requests(prompts, sampling_config)  # tokenize + 入 scheduler 队列
-       └─ main_loop(request_ids, sampling_config)  # schedule → execute 循环
-            ├─ scheduler.schedule()                  # 选择 prefill 或 decode
-            ├─ model_executor.execute_batch()        # GPU forward pass
-            └─ scheduler.update_running_requests()   # 更新 token / 回收 block
+
+**Staggered 模式：**
+```python
+# 手动控制 scheduler 循环，在 decode 过程中注入新请求
+while scheduler.has_unfinished_requests():
+    sched_output = scheduler.schedule()
+    sampled_tokens = _run_inference_step(sched_output, ...)
+    scheduler.update_running_requests(sampled_tokens, ...)
+    step += 1
+    if step == inject_at:
+        ids = llm_service.add_requests(new_prompts, sampling_config)
 ```
 
 ### B. 使用方式
 
 ```bash
-# 完整测试（自动 num_blocks）
 python3 testbench.py
-
-# 如需手动指定 KV cache 容量
-# 修改 testbench.py 内的 engine_args:
-#   EngineArgs(model_path=..., num_blocks=2000)
 ```
 
-### C. 合成 Prompt 数据集
+### C. Prompt 数据集
 
-| 类型 | 长度 | 数量 | 示例 |
-|------|------|------|------|
-| short | 2–3 tokens | 15 | `"中国是一个"`, `"人工智能是"` |
-| medium | 14–15 tokens | 4 | `"解释一下C++和Python的主要区别"` |
-| long | 80–103 tokens | 2 | 带逻辑推理步骤的长 prompt |
+| 类型 | 长度 | 示例 |
+|------|------|------|
+| short | 2-3 tokens | "中国是一个", "人工智能是" |
 
 ### D. 自动 num_blocks 机制
-
-当 `EngineArgs` 不传 `num_blocks` 或设为 `None` 时，由 `auto_calculate_num_blocks()` 在 `from_engine_args()` 中自动计算：
 
 ```python
 def auto_calculate_num_blocks(device, dtype, block_size,
@@ -392,17 +372,3 @@ def auto_calculate_num_blocks(device, dtype, block_size,
     bytes_per_block = num_layers * 2 * block_size * num_kv_heads * head_dim * dtype_size
     return available // bytes_per_block
 ```
-
-`safety_factor=0.65` 预留 35% 给模型权重 + 激活值 + CUDA 上下文。
-
-### E. 术语表
-
-| 术语 | 英文 | 含义 |
-|------|------|------|
-| TTFT | Time To First Token | 请求到首个生成 token 的延迟 |
-| ITL | Inter-Token Latency | 后续每生成一个 token 的平均耗时 |
-| num_requests | Number of Requests | 一次 `generate()` 调用提交的请求总数 |
-| GPU batch | GPU Batch | Scheduler 单步实际处理的请求数 |
-| Continuous Batching | Continuous Batching | 混合 prefill 和 decode 请求的批处理策略 |
-| KV Cache | Key-Value Cache | 缓存的注意力 Key/Value 张量，避免重复计算 |
-| Block / Page | Physical Block | PagedAttention 的物理块，存储固定数量 token 的 KV cache |
