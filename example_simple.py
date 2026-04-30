@@ -5,7 +5,7 @@ os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
 import logging
 from core import LLMService, SamplingConfig, EngineArgs
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 
 
 def main():
@@ -35,15 +35,22 @@ def main():
         formatted.append(rendered)
 
     # Generate
-    sampling_config = SamplingConfig(temperature=0.4, max_new_tokens=400)
+    sampling_config = SamplingConfig(temperature=0.4, max_new_tokens=2048)
     generated_texts = llm_service.generate(
         prompts=formatted,
         sampling_config=sampling_config,
     )
 
     for prompt, text in zip(prompts, generated_texts):
+        # Strip Qwen3's internal <think> reasoning blocks
+        clean = text
+        if "<think>" in clean:
+            if "</think>" in clean:
+                clean = clean.split("</think>", 1)[-1].strip()
+            else:
+                clean = ""
         print(f"\nPrompt: {prompt}")
-        print(f"Response: {text}")
+        print(f"Response: {clean}")
 
 
 if __name__ == "__main__":

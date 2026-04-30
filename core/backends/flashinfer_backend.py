@@ -77,7 +77,7 @@ class FlashInferBackend:
         
         self._current_metadata: Optional[AttentionMetadata] = None
         
-        logger.info(f"Initialized FlashInferBackend: num_heads={num_heads}, num_key_value_heads={self.num_key_value_heads}, "
+        logger.debug(f"Initialized FlashInferBackend: num_heads={num_heads}, num_key_value_heads={self.num_key_value_heads}, "
                    f"head_dim={head_dim}, page_size={page_size}, num_key_value_groups={self.num_key_value_groups}")
     
     def plan(self, metadata: AttentionMetadata) -> None:

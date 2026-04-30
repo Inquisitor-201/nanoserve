@@ -61,7 +61,7 @@ class BlockManager:
         self._allocated_blocks = set()
         self._lock = threading.Lock()
         
-        logger.info(f"BlockManager initialized: num_blocks={self.num_blocks}, "
+        logger.debug(f"BlockManager initialized: num_blocks={self.num_blocks}, "
                    f"block_size={self.block_size}, num_layers={self.num_layers}, "
                    f"num_kv_heads={self.num_kv_heads}, head_dim={self.head_dim}")
 

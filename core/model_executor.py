@@ -96,7 +96,7 @@ class ModelExecutor:
         else:
             raise ValueError(f"Unsupported model: {model_name}")
         
-        logger.info(f"Initialized ModelExecutor with {model_name} model: "
+        logger.debug(f"Initialized ModelExecutor with {model_name} model: "
                    f"hidden_size={model_config.hidden_size}, "
                    f"num_heads={model_config.num_heads}, "
                    f"num_layers={model_config.num_layers}")

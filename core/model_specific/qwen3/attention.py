@@ -120,7 +120,7 @@ class Qwen3Attention(nn.Module):
             layer_idx=self.layer_idx
         )
         
-        logger.info(
+        logger.debug(
             f"Initialized Qwen3Attention (layer_idx={layer_idx}): "
             f"num_heads={num_heads}, num_kv_heads={num_key_value_heads}, "
             f"head_dim={head_dim}, num_groups={self.num_key_value_groups}, "

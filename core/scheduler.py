@@ -123,8 +123,6 @@ class Scheduler:
         self.running_list: Deque[Request] = deque()
         self.completed_requests: Dict[str, Request] = {}
         self.request_id_counter = 0
-        
-        logger.info("Initialized Anti-Thrashing Scheduler")
 
     def add_request(
         self,
