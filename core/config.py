@@ -2,7 +2,75 @@ from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
 import torch
+import logging
 from transformers import AutoConfig
+
+logger = logging.getLogger(__name__)
+
+
+def auto_calculate_num_blocks(
+    device: str,
+    dtype: torch.dtype,
+    block_size: int,
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    safety_factor: float = 0.65,
+    min_blocks: int = 64,
+    max_blocks: int = 10000,
+) -> int:
+    """
+    Automatically calculate the optimal number of KV cache blocks
+    based on available GPU memory.
+
+    Args:
+        device: Target device (e.g. "cuda")
+        dtype: KV cache data type
+        block_size: Tokens per block
+        num_layers: Number of transformer layers
+        num_kv_heads: Number of key-value heads
+        head_dim: Dimension per attention head
+        safety_factor: Fraction of total GPU memory available for KV cache
+                       (rest reserved for model weights, activations, CUDA context)
+        min_blocks: Minimum allowed blocks
+        max_blocks: Maximum allowed blocks
+
+    Returns:
+        Calculated number of blocks
+    """
+    if device != "cuda" or not torch.cuda.is_available():
+        logger.info("CUDA not available, using default 256 blocks")
+        return 256
+
+    total_memory = torch.cuda.get_device_properties(0).total_memory
+    bytes_per_element = torch.tensor([], dtype=dtype).element_size()
+
+    # Per-block KV cache size: layers × 2 (K+V) × block_size × num_kv_heads × head_dim
+    bytes_per_block = (
+        num_layers
+        * 2
+        * block_size
+        * num_kv_heads
+        * head_dim
+        * bytes_per_element
+    )
+
+    if bytes_per_block <= 0:
+        logger.warning("Invalid per-block size calculation, using default 256 blocks")
+        return 256
+
+    available = int(total_memory * safety_factor)
+    blocks = available // bytes_per_block
+    blocks = max(min_blocks, min(blocks, max_blocks))
+
+    total_gib = total_memory / (1024 ** 3)
+    kv_gib = (blocks * bytes_per_block) / (1024 ** 3)
+    logger.info(
+        f"Auto-calculated num_blocks={blocks} "
+        f"(GPU: {total_gib:.1f} GiB, KV cache: {kv_gib:.2f} GiB, "
+        f"{safety_factor*100:.0f}% utilization)"
+    )
+    return blocks
 
 
 @dataclass(frozen=True)
@@ -140,7 +208,7 @@ class EngineArgs:
     model_path: str
     device: str = "cuda"
     block_size: int = 16
-    num_blocks: int = 1000
+    num_blocks: Optional[int] = None  # None = auto-calculate from GPU memory
     max_num_seqs: int = 256
     dtype: torch.dtype = torch.bfloat16
     attention_backend: str = "flashinfer"

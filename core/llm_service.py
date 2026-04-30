@@ -12,6 +12,7 @@ from .model_executor import ModelExecutor
 from .block_manager import BlockManager
 from .scheduler import Scheduler, Request
 from .config import SamplingConfig, ModelConfig, EngineArgs, CacheConfig, SchedulerConfig
+from .config import auto_calculate_num_blocks
 from .utils import ContinuousBatchTimer
 
 
@@ -77,10 +78,22 @@ class LLMService:
             dtype=engine_args.dtype
         )
 
-        # 2. Core: Construct CacheConfig
+        # 2. Core: Determine num_blocks (auto-calculate if not specified)
+        num_blocks = engine_args.num_blocks
+        if num_blocks is None or num_blocks <= 0:
+            num_blocks = auto_calculate_num_blocks(
+                device=engine_args.device,
+                dtype=engine_args.dtype,
+                block_size=engine_args.block_size,
+                num_layers=model_config.num_layers,
+                num_kv_heads=model_config.num_key_value_heads,
+                head_dim=model_config.head_dim,
+            )
+
+        # 3. Core: Construct CacheConfig
         # This handles parts "passed in by the user (such as block_size)"
         cache_config = CacheConfig(
-            num_blocks=engine_args.num_blocks,
+            num_blocks=num_blocks,
             block_size=engine_args.block_size,
             device=engine_args.device
         )
