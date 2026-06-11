@@ -12,6 +12,8 @@ from functools import partial
 import flashinfer
 
 from ...backends import AttentionMetadata, FlashInferBackend, TorchBackend
+from ...layers_utils import Linear
+from ...quantization import QuantizationConfig
 from .mlp import Qwen3MLP
 
 logger = logging.getLogger(__name__)
@@ -41,25 +43,11 @@ class Qwen3Attention(nn.Module):
         rope_theta,
         bias: bool = False,
         device: str = None,
-        dtype = None
+        dtype = None,
+        quantization: Optional[QuantizationConfig] = None,
     ):
-        """
-        Initialize Qwen3 attention layer.
-        
-        Args:
-            hidden_size: Hidden size of the model (e.g., 1024 for Qwen3-0.6B)
-            num_heads: Number of attention heads for queries (e.g., 16)
-            head_dim: Dimension of each attention head (e.g., 128)
-            attention_backend: FlashInferBackend instance for attention computation
-            layer_idx: Layer index for KV cache pool access
-            num_key_value_heads: Number of key/value heads (e.g., 8 for GQA)
-            rope_theta: Base for RoPE rotary embeddings (default: 1M for Qwen3)
-            bias: Whether to use bias in linear projections
-            device: Computing device
-            dtype: Data type
-        """
         super().__init__()
-        
+
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -67,48 +55,19 @@ class Qwen3Attention(nn.Module):
         self.layer_idx = layer_idx
         self.rope_theta = rope_theta
         self.backend = attention_backend
-        
-        # GQA validation
+
         if num_heads % num_key_value_heads != 0:
             raise ValueError(
                 f"num_heads ({num_heads}) must be divisible by "
                 f"num_key_value_heads ({num_key_value_heads})"
             )
         self.num_key_value_groups = num_heads // num_key_value_heads
-        
-        # QKV projections
-        self.q_proj = nn.Linear(
-            hidden_size,
-            num_heads * head_dim,
-            bias=bias,
-            device=device,
-            dtype=dtype
-        )
-        
-        self.k_proj = nn.Linear(
-            hidden_size,
-            num_key_value_heads * head_dim,
-            bias=bias,
-            device=device,
-            dtype=dtype
-        )
-        
-        self.v_proj = nn.Linear(
-            hidden_size,
-            num_key_value_heads * head_dim,
-            bias=bias,
-            device=device,
-            dtype=dtype
-        )
-        
-        # Output projection
-        self.o_proj = nn.Linear(
-            num_heads * head_dim,
-            hidden_size,
-            bias=bias,
-            device=device,
-            dtype=dtype
-        )
+
+        # Build linear layers — AWQLinear when quantised, nn.Linear otherwise
+        self.q_proj = Linear(hidden_size, num_heads * head_dim, quantization=quantization, bias=bias, device=device, dtype=dtype)
+        self.k_proj = Linear(hidden_size, num_key_value_heads * head_dim, quantization=quantization, bias=bias, device=device, dtype=dtype)
+        self.v_proj = Linear(hidden_size, num_key_value_heads * head_dim, quantization=quantization, bias=bias, device=device, dtype=dtype)
+        self.o_proj = Linear(num_heads * head_dim, hidden_size, quantization=quantization, bias=bias, device=device, dtype=dtype)
         
         # QK normalization (specific to Qwen3)
         self.q_norm = nn.RMSNorm(head_dim, eps=1e-6, device=device, dtype=dtype)
@@ -208,31 +167,14 @@ class Qwen3DecoderLayer(nn.Module):
         rms_norm_eps: float = 1e-6,
         bias: bool = False,
         device: str = None,
-        dtype = None
+        dtype = None,
+        quantization: Optional[QuantizationConfig] = None,
     ):
-        """
-        Initialize Qwen3 decoder layer.
-        
-        Args:
-            hidden_size: Hidden size of the model
-            num_heads: Number of query attention heads
-            head_dim: Dimension of each attention head
-            intermediate_size: MLP intermediate size
-            attention_backend: Backend for attention computation
-            layer_idx: Layer index
-            num_key_value_heads: Number of key/value heads (GQA)
-            rope_theta: Base for RoPE rotary embeddings
-            rms_norm_eps: RMS norm epsilon
-            bias: Whether to use bias in linear layers
-            device: Computing device
-            dtype: Data type
-        """
         super().__init__()
-        
+
         self.hidden_size = hidden_size
         self.layer_idx = layer_idx
-        
-        # Self-attention with GQA
+
         self.self_attn = Qwen3Attention(
             hidden_size=hidden_size,
             num_heads=num_heads,
@@ -243,7 +185,8 @@ class Qwen3DecoderLayer(nn.Module):
             rope_theta=rope_theta,
             bias=bias,
             device=device,
-            dtype=dtype
+            dtype=dtype,
+            quantization=quantization,
         )
         
         # MLP
@@ -252,7 +195,8 @@ class Qwen3DecoderLayer(nn.Module):
             intermediate_size=intermediate_size,
             bias=bias,
             device=device,
-            dtype=dtype
+            dtype=dtype,
+            quantization=quantization,
         )
         
         # Layer normalizations

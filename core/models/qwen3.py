@@ -14,6 +14,7 @@ import torch.nn as nn
 from ..layers_utils import Embedding
 from ..backends import AttentionMetadata, FlashInferBackend, TorchBackend
 from ..model_specific.qwen3.attention import Qwen3DecoderLayer
+from ..quantization import QuantizationConfig
 
 
 class Qwen3Model(nn.Module):
@@ -46,25 +47,8 @@ class Qwen3Model(nn.Module):
         kv_cache_pool: torch.Tensor,
         rope_theta: float,
         block_size: int,
+        quantization: Optional[QuantizationConfig] = None,
     ):
-        """
-        Initialize Qwen3 model.
-        
-        Args:
-            vocab_size: Size of vocabulary (e.g., 151936 for Qwen3)
-            hidden_size: Hidden size (e.g., 1024 for Qwen3-0.6B)
-            num_heads: Number of attention heads (e.g., 16)
-            num_key_value_heads: Number of key/value heads for GQA (e.g., 8)
-            head_dim: Dimension of each attention head (e.g., 128)
-            intermediate_size: MLP intermediate size (e.g., 3072)
-            num_layers: Number of decoder layers (e.g., 28)
-            attention_backend_type: Type of attention backend ("flashinfer")
-            dtype: Data type for computations
-            device: Computing device
-            kv_cache_pool: Pre-allocated KV cache pool from BlockManager
-            rope_theta: Base for RoPE rotary embeddings (default: 1M for Qwen3)
-            block_size: Size of each cache block (must match BlockManager)
-        """
         super().__init__()
         
         self.vocab_size = vocab_size
@@ -119,7 +103,8 @@ class Qwen3Model(nn.Module):
                 rms_norm_eps=1e-6,
                 bias=False,
                 device=device,
-                dtype=dtype
+                dtype=dtype,
+                quantization=quantization,
             )
             for layer_idx in range(num_layers)
         ])

@@ -3,9 +3,14 @@ Generic utility layers that are model-agnostic.
 Contains pure mathematical operations used across different models.
 """
 
+from __future__ import annotations
+from typing import Optional, TYPE_CHECKING
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from .quantization import QuantizationConfig
 
 
 class RMSNorm(nn.Module):
@@ -115,51 +120,21 @@ class GELU(nn.Module):
         return F.gelu(x, approximate='tanh')
 
 
-class Linear(nn.Module):
-    """
-    Generic linear layer.
-    
-    Wrapper around nn.Linear for consistency.
-    
-    Args:
-        in_features: Input feature dimension
-        out_features: Output feature dimension
-        bias: Whether to include bias term
-        device: Computing device
-        dtype: Data type
-    """
-    
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = False,
-        device: str = None,
-        dtype = None
-    ):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        
-        self.weight = nn.Parameter(
-            torch.empty(out_features, in_features, device=device, dtype=dtype)
+def Linear(
+    in_features: int,
+    out_features: int,
+    *,
+    quantization: Optional["QuantizationConfig"] = None,
+    bias: bool = False,
+    device: Optional[str] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> nn.Module:
+    """Build a linear layer — quantised (AWQ) when config is provided, plain otherwise."""
+    if quantization is not None:
+        from .quantization import AWQLinear
+        return AWQLinear(
+            in_features, out_features,
+            device=device, dtype=dtype,
+            bits=quantization.bits, group_size=quantization.group_size,
         )
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(out_features, device=device, dtype=dtype))
-        else:
-            self.register_parameter('bias', None)
-        
-        nn.init.kaiming_uniform_(self.weight, nonlinearity='linear')
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Apply linear transformation.
-        
-        Args:
-            x: Input tensor of shape (..., in_features)
-            
-        Returns:
-            Output tensor of shape (..., out_features)
-        """
-        x = F.linear(x, self.weight, self.bias)
-        return x
+    return nn.Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)

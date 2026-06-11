@@ -82,17 +82,20 @@ class ModelExecutor:
                 device=self.device,
                 kv_cache_pool=self.kv_cache_pool,
                 rope_theta=model_config.rope_theta,
-                block_size=cache_config.block_size
+                block_size=cache_config.block_size,
+                quantization=model_config.quantization,
             )
-            
+
             if model_path:
                 ModelLoader.load_weights(
-                    self.model, 
-                    model_path, 
-                    self.dtype, 
-                    self.device
+                    self.model,
+                    model_path,
+                    self.dtype,
+                    self.device,
                 )
-                
+                if model_config.quantization:
+                    ModelLoader.post_process_awq(self.model)
+
         else:
             raise ValueError(f"Unsupported model: {model_name}")
         
