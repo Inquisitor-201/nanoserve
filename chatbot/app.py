@@ -90,6 +90,7 @@ def chat():
         # 创建临时的 sampling config，使用前端传入的 max_new_tokens
         temp_sampling_config = SamplingConfig(
             temperature=0.0,
+            top_p=0.9,
             max_new_tokens=max_new_tokens,
         )
         

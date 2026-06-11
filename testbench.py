@@ -183,7 +183,7 @@ def main():
     # Warmup: one small burst to compile CUDA kernels
     print("  Warming up (1 round of 4 requests)...")
     warmup_prompts = build_prompts(4)
-    warmup_cfg = SamplingConfig(temperature=0.7, max_new_tokens=32)
+    warmup_cfg = SamplingConfig(temperature=0.7, top_p=0.9, max_new_tokens=32)
     llm_service.generate(warmup_prompts, warmup_cfg)
 
     # ── Test matrix ──

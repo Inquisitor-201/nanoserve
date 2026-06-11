@@ -26,21 +26,6 @@ def auto_calculate_num_blocks(
     """
     Automatically calculate the optimal number of KV cache blocks
     based on available GPU memory.
-
-    Args:
-        device: Target device (e.g. "cuda")
-        dtype: KV cache data type
-        block_size: Tokens per block
-        num_layers: Number of transformer layers
-        num_kv_heads: Number of key-value heads
-        head_dim: Dimension per attention head
-        safety_factor: Fraction of total GPU memory available for KV cache
-                       (rest reserved for model weights, activations, CUDA context)
-        min_blocks: Minimum allowed blocks
-        max_blocks: Maximum allowed blocks
-
-    Returns:
-        Calculated number of blocks
     """
     if device != "cuda" or not torch.cuda.is_available():
         logger.info("CUDA not available, using default 256 blocks")
@@ -49,7 +34,6 @@ def auto_calculate_num_blocks(
     total_memory = torch.cuda.get_device_properties(0).total_memory
     bytes_per_element = torch.tensor([], dtype=dtype).element_size()
 
-    # Per-block KV cache size: layers × 2 (K+V) × block_size × num_kv_heads × head_dim
     bytes_per_block = (
         num_layers
         * 2
@@ -80,28 +64,22 @@ def auto_calculate_num_blocks(
 # ── SamplingConfig: per-request ──────────────────────────────────────────────
 #
 # Scope:  how a single generation request samples output tokens.
-# Owner:  SamplingConfig is attached to each Request in the scheduler.
+# Owner:  attached to each Request in the scheduler.
 #         Different requests can have different SamplingConfigs.
-# Source: user-provided (API / EngineArgs has no sampling defaults).
-# Frozen: yes — immutable after creation.
+# Source: user-provided (API). All fields required — no defaults.
+# Frozen: yes.
 #
 @dataclass(frozen=True)
 class SamplingConfig:
-    temperature: float = 1.0
-    top_p: float = 0.9
-    max_new_tokens: int = 100
-    repetition_penalty: float = 1.0
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
+    temperature: float
+    top_p: float
+    max_new_tokens: int
 
     def to_dict(self) -> dict:
         return {
             "temperature": self.temperature,
             "top_p": self.top_p,
             "max_new_tokens": self.max_new_tokens,
-            "repetition_penalty": self.repetition_penalty,
-            "presence_penalty": self.presence_penalty,
-            "frequency_penalty": self.frequency_penalty,
         }
 
     @classmethod
@@ -112,60 +90,48 @@ class SamplingConfig:
 # ── ModelConfig: global singleton ─────────────────────────────────────────────
 #
 # Scope:  model architecture dimensions (num_heads, hidden_size, num_layers …)
-#         and quantization metadata. These are structural parameters baked into
-#         the model graph and weight layout.
+#         and quantization metadata. These are baked into the model graph and
+#         weight layout.
 # Owner:  One per LLMService instance. Created from HF config.json at startup.
-# Sub-config: quantization (QuantizationConfig) — only meaningful when
+# Source: ModelConfig.from_hf(model_path, dtype) — reads HuggingFace AutoConfig.
+#         The dtype field is caller-supplied (overrides HF torch_dtype).
+# Sub-config: quantization (QuantizationConfig | None) — present only when
 #         the model weights are quantized (AWQ / GPTQ).
-# Source: ModelConfig.from_hf(model_path) — reads HuggingFace AutoConfig.
-#         The dtype field is an exception: caller supplies it (BF16 default).
 # Frozen: yes — must match the loaded weights exactly.
 #
 @dataclass(frozen=True)
 class ModelConfig:
-    num_heads: int = 32
-    num_key_value_heads: Optional[int] = None
-    head_dim: int = 128
-    hidden_size: int = 4096
-    rope_theta: float = 1000000.0
-    dtype: torch.dtype = torch.bfloat16
-    vocab_size: Optional[int] = None
-    intermediate_size: Optional[int] = None
-    num_layers: Optional[int] = None
-    quantization: QuantizationConfig = QuantizationConfig()
+    num_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    hidden_size: int
+    rope_theta: float
+    dtype: torch.dtype
+    vocab_size: int
+    intermediate_size: int
+    num_layers: int
+    quantization: Optional[QuantizationConfig] = None
 
     @classmethod
     def from_hf(
         cls,
         model_path: str,
-        dtype: torch.dtype = torch.bfloat16
+        dtype: torch.dtype = torch.bfloat16,
     ) -> "ModelConfig":
-        """
-        Load model parameters from HuggingFace configuration.
-
-        Args:
-            model_path: Model path
-            dtype: Data type
-
-        Returns:
-            ModelConfig object
-        """
+        """Load model architecture from HuggingFace ``config.json``."""
         from transformers import AutoConfig
 
         hf_config = AutoConfig.from_pretrained(model_path)
 
-        hidden_size = getattr(hf_config, 'hidden_size', 4096)
-        num_heads = getattr(hf_config, 'num_attention_heads', 32)
-        num_key_value_heads = getattr(hf_config, 'num_key_value_heads', None)
-        head_dim = getattr(hf_config, 'head_dim', hidden_size // num_heads)
-        vocab_size = getattr(hf_config, 'vocab_size', 32000)
-        intermediate_size = getattr(hf_config, 'intermediate_size', None)
-        num_layers = getattr(hf_config, 'num_hidden_layers', None)
-        rope_theta = getattr(hf_config, 'rope_theta', 1000000.0)
+        hidden_size = getattr(hf_config, "hidden_size")
+        num_heads = getattr(hf_config, "num_attention_heads")
+        num_key_value_heads = getattr(hf_config, "num_key_value_heads", num_heads)
+        head_dim = getattr(hf_config, "head_dim", hidden_size // num_heads)
+        vocab_size = getattr(hf_config, "vocab_size")
+        intermediate_size = getattr(hf_config, "intermediate_size")
+        num_layers = getattr(hf_config, "num_hidden_layers")
+        rope_theta = getattr(hf_config, "rope_theta", 1000000.0)
         quantization = QuantizationConfig.from_hf_config(hf_config)
-
-        if num_key_value_heads is None:
-            num_key_value_heads = num_heads
 
         return cls(
             num_heads=num_heads,
@@ -191,29 +157,30 @@ class ModelConfig:
             "vocab_size": self.vocab_size,
             "intermediate_size": self.intermediate_size,
             "num_layers": self.num_layers,
-            "quantization": self.quantization.to_dict() if self.quantization.is_quantized() else None,
+            "quantization": self.quantization.to_dict() if self.quantization else None,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "ModelConfig":
-        return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})
+        kwargs = {k: v for k, v in data.items() if k in cls.__annotations__}
+        if isinstance(kwargs.get("quantization"), dict):
+            kwargs["quantization"] = QuantizationConfig.from_dict(kwargs["quantization"])
+        return cls(**kwargs)
 
 
 # ── CacheConfig: global singleton ─────────────────────────────────────────────
 #
 # Scope:  KV cache pool geometry (num_blocks, block_size) and target device.
 #         BlockManager reads this to pre-allocate the GPU KV cache pool.
-# Owner:  One per LLMService instance. Shared across all requests in the batch.
-# Source: EngineArgs — user provides block_size and optionally num_blocks.
-#         If num_blocks is None, LLMService.from_engine_args() auto-calculates
-#         it from available GPU memory (see auto_calculate_num_blocks).
-# Frozen: yes — pool allocation is done once at startup.
+# Owner:  One per LLMService instance. Shared across all requests.
+# Source: EngineArgs (user-provided or auto-calculated). All fields required.
+# Frozen: yes.
 #
 @dataclass(frozen=True)
 class CacheConfig:
-    num_blocks: int = 1000
-    block_size: int = 16
-    device: str = "cuda"
+    num_blocks: int
+    block_size: int
+    device: str
 
     def to_dict(self) -> dict:
         return {
@@ -229,15 +196,14 @@ class CacheConfig:
 
 # ── SchedulerConfig: global singleton ─────────────────────────────────────────
 #
-# Scope:  continuous batching limits (max_num_seqs controls how many sequences
-#         can be active in a single schedule() call).
+# Scope:  continuous batching limits (max_num_seqs).
 # Owner:  One per LLMService instance. The Scheduler reads it.
-# Source: EngineArgs — user provides max_num_seqs (default 256).
+# Source: EngineArgs (user-provided).
 # Frozen: yes.
 #
 @dataclass(frozen=True)
 class SchedulerConfig:
-    max_num_seqs: int = 256
+    max_num_seqs: int
 
     def to_dict(self) -> dict:
         return {
@@ -249,31 +215,30 @@ class SchedulerConfig:
         return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})
 
 
-# ── EngineArgs: user-facing entry point ───────────────────────────────────────
+# ── EngineArgs: user-facing entry point (single source of defaults) ───────────
 #
-# Scope:  the sole user-facing config struct. It carries enough information to
-#         derive ModelConfig + CacheConfig + SchedulerConfig (the three global
-#         singletons) via create_engine_configs().
-# Owner:  Transient — consumed by LLMService.from_engine_args(), which then
-#         discards it. Not stored on LLMService after init.
+# Scope:  the sole user-facing config struct. Carries enough information to
+#         derive ModelConfig + CacheConfig + SchedulerConfig via
+#         create_engine_configs().
+# Owner:  Transient — consumed by LLMService.from_engine_args(), not stored.
 # Source: user-provided (CLI / API).
-# Frozen: yes (dataclass(frozen=True)).
+# Frozen: yes.
 #
-# Fields that feed directly into the derived configs:
-#   model_path   → ModelConfig.from_hf(model_path)
-#   dtype        → ModelConfig.dtype  (override HF default)
+# Fields → derived configs:
+#   model_path   → ModelConfig.from_hf(model_path, dtype)
+#   dtype        → ModelConfig.dtype
 #   block_size   → CacheConfig.block_size
 #   num_blocks   → CacheConfig.num_blocks  (None = auto-calculate)
 #   device       → CacheConfig.device
 #   max_num_seqs → SchedulerConfig.max_num_seqs
-#   attention_backend → ModelExecutor init (not stored in configs)
+#   attention_backend → ModelExecutor init (not stored in a config)
 #
 @dataclass(frozen=True)
 class EngineArgs:
     model_path: str
     device: str = "cuda"
     block_size: int = 16
-    num_blocks: Optional[int] = None  # None = auto-calculate from GPU memory
+    num_blocks: Optional[int] = None
     max_num_seqs: int = 256
     dtype: torch.dtype = torch.bfloat16
     attention_backend: str = "flashinfer"
@@ -283,19 +248,19 @@ class EngineArgs:
             raise ValueError(f"Model path does not exist: {self.model_path}")
 
     def create_engine_configs(self):
-        """Create engine configs from EngineArgs."""
+        """Derive the three global configs from this EngineArgs."""
         model_config = ModelConfig.from_hf(self.model_path, self.dtype)
-        
+
         cache_config = CacheConfig(
             num_blocks=self.num_blocks,
             block_size=self.block_size,
             device=self.device,
         )
-        
+
         scheduler_config = SchedulerConfig(
             max_num_seqs=self.max_num_seqs,
         )
-        
+
         return model_config, cache_config, scheduler_config
 
     def to_dict(self) -> dict:

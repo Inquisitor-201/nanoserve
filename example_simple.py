@@ -35,7 +35,7 @@ def main():
         formatted.append(rendered)
 
     # Generate
-    sampling_config = SamplingConfig(temperature=0.4, max_new_tokens=2048)
+    sampling_config = SamplingConfig(temperature=0.4, top_p=0.9, max_new_tokens=2048)
     generated_texts = llm_service.generate(
         prompts=formatted,
         sampling_config=sampling_config,
