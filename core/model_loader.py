@@ -2,8 +2,9 @@
 Model weight loader module.
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 import os
+import re
 import logging
 import torch
 from safetensors.torch import load_file
@@ -39,20 +40,68 @@ class ModelLoader:
         for hf_name, param in state_dict.items():
             mapped_name = ModelLoader._map_weight_name(hf_name)
 
-            # Try parameter first (nn.Linear, RMSNorm, Embedding),
-            # then fall back to buffer (AWQLinear qweight / qzeros / scales).
+            # Resolve param (handles fused QKV shards), fall back to buffer (AWQ qweight etc.)
             try:
-                model_param = model.get_parameter(mapped_name)
+                model_param = ModelLoader._resolve_param(model, mapped_name)
             except AttributeError:
                 model_param = model.get_buffer(mapped_name)
 
             if param.dtype != model_param.dtype:
                 param = param.to(model_param.dtype)
-
             with torch.no_grad():
                 model_param.copy_(param)
 
         logger.info("Successfully loaded model weights")
+
+    @staticmethod
+    def _resolve_param(model: torch.nn.Module, name: str) -> torch.Tensor:
+        """Resolve *name* to the target parameter tensor.
+
+        Tries normal ``get_parameter`` first; falls back to stacked-param
+        resolution for fused projections (e.g. ``q_proj.weight`` →
+        a slice of ``qkv_proj.weight``).
+        """
+        try:
+            return model.get_parameter(name)
+        except AttributeError:
+            shard = ModelLoader._resolve_stacked_shard(model, name)
+            if shard is not None:
+                return shard[0]
+            raise
+
+    # Regex for stacked param names:  {path}.{q,k,v}_proj.{weight,bias}
+    _STACKED_PARAM_RE = re.compile(
+        r"^(.*\.self_attn)\.([qkv])_proj\.(weight|bias)$"
+    )
+
+    @staticmethod
+    def _resolve_stacked_shard(
+        model: torch.nn.Module, name: str
+    ) -> Optional[Tuple[torch.Tensor, int]]:
+        """If *name* refers to a shard of a fused QKV projection,
+        return ``(fused_param, dim_0_offset)``.
+
+        The target module must expose a ``_qkv_shard_info`` dict:
+        ``{shard_id: (offset, size)}``.
+        """
+        m = ModelLoader._STACKED_PARAM_RE.match(name)
+        if not m:
+            return None
+
+        module_path, shard_id, suffix = m.groups()
+        module = model.get_submodule(module_path)
+
+        shard_info = getattr(module, "_qkv_shard_info", None)
+        if shard_info is None:
+            return None
+
+        offset, size = shard_info[shard_id]
+        fused_name = f"{module_path}.qkv_proj.{suffix}"
+        fused_param = model.get_parameter(fused_name)
+
+        # Narrow to the correct slice on dim 0
+        view = fused_param.narrow(0, offset, size)
+        return (view, offset)
 
     @staticmethod
     def _map_weight_name(hf_name: str) -> str:

@@ -63,11 +63,35 @@ class Qwen3Attention(nn.Module):
             )
         self.num_key_value_groups = num_heads // num_key_value_heads
 
-        # Build linear layers — AWQLinear when quantised, nn.Linear otherwise
-        self.q_proj = Linear(hidden_size, num_heads * head_dim, quantization=quantization, device=device, dtype=dtype)
-        self.k_proj = Linear(hidden_size, num_key_value_heads * head_dim, quantization=quantization, device=device, dtype=dtype)
-        self.v_proj = Linear(hidden_size, num_key_value_heads * head_dim, quantization=quantization, device=device, dtype=dtype)
-        self.o_proj = Linear(num_heads * head_dim, hidden_size, quantization=quantization, device=device, dtype=dtype)
+        # Fused QKV projection (one GEMM instead of three)
+        q_size = num_heads * head_dim
+        kv_size = num_key_value_heads * head_dim
+        self.q_size = q_size
+        self.kv_size = kv_size
+
+        self.qkv_proj = Linear(
+            hidden_size,
+            q_size + 2 * kv_size,
+            quantization=quantization,
+            device=device,
+            dtype=dtype
+        )
+
+        # Output projection
+        self.o_proj = Linear(
+            num_heads * head_dim,
+            hidden_size,
+            quantization=quantization,
+            device=device,
+            dtype=dtype
+        )
+
+        # Expose shard layout for the weight loader
+        self._qkv_shard_info = {
+            "q": (0, q_size),
+            "k": (q_size, kv_size),
+            "v": (q_size + kv_size, kv_size),
+        }
 
         # QK normalization (specific to Qwen3)
         self.q_norm = nn.RMSNorm(head_dim, eps=rms_norm_eps, device=device, dtype=dtype)
@@ -102,17 +126,15 @@ class Qwen3Attention(nn.Module):
         Returns:
             Output hidden states of same shape, or tuple with debug info if return_debug_info=True
         """
-        total_tokens, hidden_size = hidden_states.shape
-        
-        # QKV projections
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
-        
-        # Reshape for attention
-        q = q.view(total_tokens, self.num_heads, self.head_dim)
-        k = k.view(total_tokens, self.num_key_value_heads, self.head_dim)
-        v = v.view(total_tokens, self.num_key_value_heads, self.head_dim)
+        total_tokens, _ = hidden_states.shape
+
+        # Fused QKV projection (one GEMM, split into views)
+        qkv = self.qkv_proj(hidden_states)                     # [T, q_size + 2*kv_size]
+        qkv = qkv.view(total_tokens, -1, self.head_dim)        # [T, H_q + 2*H_kv, D]
+        q, k, v = qkv.split(
+            [self.num_heads, self.num_key_value_heads, self.num_key_value_heads],
+            dim=1,
+        )
         
         # Apply QK normalization (first, before RoPE) - following actual Qwen3 implementation
         q_after_norm = self.q_norm(q)
