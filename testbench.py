@@ -168,7 +168,7 @@ def main():
 
     engine_args = EngineArgs(
         model_path="./models/Qwen3-0.6B",
-        device="cuda", block_size=16, dtype=torch.bfloat16,
+        device="cuda", block_size=16,
     )
     llm_service = LLMService.from_engine_args(engine_args)
 

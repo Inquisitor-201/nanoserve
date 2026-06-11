@@ -93,8 +93,9 @@ class SamplingConfig:
 #         and quantization metadata. These are baked into the model graph and
 #         weight layout.
 # Owner:  One per LLMService instance. Created from HF config.json at startup.
-# Source: ModelConfig.from_hf(model_path, dtype) — reads HuggingFace AutoConfig.
-#         The dtype field is caller-supplied (overrides HF torch_dtype).
+# Source: ModelConfig.from_hf(model_path) — reads HuggingFace AutoConfig.
+#         The dtype field is read from HF config's ``torch_dtype`` (caller
+#         can override via the optional ``dtype`` parameter).
 # Sub-config: quantization (QuantizationConfig | None) — present only when
 #         the model weights are quantized (AWQ / GPTQ).
 # Frozen: yes — must match the loaded weights exactly.
@@ -116,9 +117,13 @@ class ModelConfig:
     def from_hf(
         cls,
         model_path: str,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: Optional[torch.dtype] = None,
     ) -> "ModelConfig":
-        """Load model architecture from HuggingFace ``config.json``."""
+        """Load model architecture from HuggingFace ``config.json``.
+
+        When ``dtype`` is ``None`` (the default), the model's native
+        ``torch_dtype`` from ``config.json`` is used.
+        """
         from transformers import AutoConfig
 
         hf_config = AutoConfig.from_pretrained(model_path)
@@ -131,6 +136,8 @@ class ModelConfig:
         intermediate_size = getattr(hf_config, "intermediate_size")
         num_layers = getattr(hf_config, "num_hidden_layers")
         rope_theta = getattr(hf_config, "rope_theta", 1000000.0)
+        if dtype is None:
+            dtype = getattr(hf_config, "torch_dtype", torch.bfloat16)
         quantization = QuantizationConfig.from_hf_config(hf_config)
 
         return cls(
@@ -225,12 +232,11 @@ class SchedulerConfig:
 # Frozen: yes.
 #
 # Fields → derived configs:
-#   model_path   → ModelConfig.from_hf(model_path, dtype)
-#   dtype        → ModelConfig.dtype
-#   block_size   → CacheConfig.block_size
-#   num_blocks   → CacheConfig.num_blocks  (None = auto-calculate)
-#   device       → CacheConfig.device
-#   max_num_seqs → SchedulerConfig.max_num_seqs
+#   model_path        → ModelConfig.from_hf(model_path)
+#   block_size        → CacheConfig.block_size
+#   num_blocks        → CacheConfig.num_blocks  (None = auto-calculate)
+#   device            → CacheConfig.device
+#   max_num_seqs      → SchedulerConfig.max_num_seqs
 #   attention_backend → ModelExecutor init (not stored in a config)
 #
 @dataclass(frozen=True)
@@ -240,7 +246,6 @@ class EngineArgs:
     block_size: int = 16
     num_blocks: Optional[int] = None
     max_num_seqs: int = 256
-    dtype: torch.dtype = torch.bfloat16
     attention_backend: str = "flashinfer"
 
     def __post_init__(self):
@@ -249,7 +254,7 @@ class EngineArgs:
 
     def create_engine_configs(self):
         """Derive the three global configs from this EngineArgs."""
-        model_config = ModelConfig.from_hf(self.model_path, self.dtype)
+        model_config = ModelConfig.from_hf(self.model_path)
 
         cache_config = CacheConfig(
             num_blocks=self.num_blocks,
@@ -270,7 +275,6 @@ class EngineArgs:
             "block_size": self.block_size,
             "num_blocks": self.num_blocks,
             "max_num_seqs": self.max_num_seqs,
-            "dtype": self.dtype,
             "attention_backend": self.attention_backend,
         }
 

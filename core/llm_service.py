@@ -73,17 +73,14 @@ class LLMService:
         """
         # 1. Core: Load and parse ModelConfig from HF
         # This handles all parts that "must be read from huggingface config"
-        model_config = ModelConfig.from_hf(
-            model_path=engine_args.model_path,
-            dtype=engine_args.dtype
-        )
+        model_config = ModelConfig.from_hf(model_path=engine_args.model_path)
 
         # 2. Core: Determine num_blocks (auto-calculate if not specified)
         num_blocks = engine_args.num_blocks
         if num_blocks is None or num_blocks <= 0:
             num_blocks = auto_calculate_num_blocks(
                 device=engine_args.device,
-                dtype=engine_args.dtype,
+                dtype=model_config.dtype,
                 block_size=engine_args.block_size,
                 num_layers=model_config.num_layers,
                 num_kv_heads=model_config.num_key_value_heads,
