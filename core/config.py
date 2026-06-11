@@ -9,6 +9,9 @@ from .quantization.config import QuantizationConfig
 logger = logging.getLogger(__name__)
 
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+
 def auto_calculate_num_blocks(
     device: str,
     dtype: torch.dtype,
@@ -74,6 +77,14 @@ def auto_calculate_num_blocks(
     return blocks
 
 
+# ── SamplingConfig: per-request ──────────────────────────────────────────────
+#
+# Scope:  how a single generation request samples output tokens.
+# Owner:  SamplingConfig is attached to each Request in the scheduler.
+#         Different requests can have different SamplingConfigs.
+# Source: user-provided (API / EngineArgs has no sampling defaults).
+# Frozen: yes — immutable after creation.
+#
 @dataclass(frozen=True)
 class SamplingConfig:
     temperature: float = 1.0
@@ -98,6 +109,18 @@ class SamplingConfig:
         return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})
 
 
+# ── ModelConfig: global singleton ─────────────────────────────────────────────
+#
+# Scope:  model architecture dimensions (num_heads, hidden_size, num_layers …)
+#         and quantization metadata. These are structural parameters baked into
+#         the model graph and weight layout.
+# Owner:  One per LLMService instance. Created from HF config.json at startup.
+# Sub-config: quantization (QuantizationConfig) — only meaningful when
+#         the model weights are quantized (AWQ / GPTQ).
+# Source: ModelConfig.from_hf(model_path) — reads HuggingFace AutoConfig.
+#         The dtype field is an exception: caller supplies it (BF16 default).
+# Frozen: yes — must match the loaded weights exactly.
+#
 @dataclass(frozen=True)
 class ModelConfig:
     num_heads: int = 32
@@ -176,6 +199,16 @@ class ModelConfig:
         return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})
 
 
+# ── CacheConfig: global singleton ─────────────────────────────────────────────
+#
+# Scope:  KV cache pool geometry (num_blocks, block_size) and target device.
+#         BlockManager reads this to pre-allocate the GPU KV cache pool.
+# Owner:  One per LLMService instance. Shared across all requests in the batch.
+# Source: EngineArgs — user provides block_size and optionally num_blocks.
+#         If num_blocks is None, LLMService.from_engine_args() auto-calculates
+#         it from available GPU memory (see auto_calculate_num_blocks).
+# Frozen: yes — pool allocation is done once at startup.
+#
 @dataclass(frozen=True)
 class CacheConfig:
     num_blocks: int = 1000
@@ -194,6 +227,14 @@ class CacheConfig:
         return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})
 
 
+# ── SchedulerConfig: global singleton ─────────────────────────────────────────
+#
+# Scope:  continuous batching limits (max_num_seqs controls how many sequences
+#         can be active in a single schedule() call).
+# Owner:  One per LLMService instance. The Scheduler reads it.
+# Source: EngineArgs — user provides max_num_seqs (default 256).
+# Frozen: yes.
+#
 @dataclass(frozen=True)
 class SchedulerConfig:
     max_num_seqs: int = 256
@@ -208,6 +249,25 @@ class SchedulerConfig:
         return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})
 
 
+# ── EngineArgs: user-facing entry point ───────────────────────────────────────
+#
+# Scope:  the sole user-facing config struct. It carries enough information to
+#         derive ModelConfig + CacheConfig + SchedulerConfig (the three global
+#         singletons) via create_engine_configs().
+# Owner:  Transient — consumed by LLMService.from_engine_args(), which then
+#         discards it. Not stored on LLMService after init.
+# Source: user-provided (CLI / API).
+# Frozen: yes (dataclass(frozen=True)).
+#
+# Fields that feed directly into the derived configs:
+#   model_path   → ModelConfig.from_hf(model_path)
+#   dtype        → ModelConfig.dtype  (override HF default)
+#   block_size   → CacheConfig.block_size
+#   num_blocks   → CacheConfig.num_blocks  (None = auto-calculate)
+#   device       → CacheConfig.device
+#   max_num_seqs → SchedulerConfig.max_num_seqs
+#   attention_backend → ModelExecutor init (not stored in configs)
+#
 @dataclass(frozen=True)
 class EngineArgs:
     model_path: str

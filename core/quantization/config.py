@@ -1,3 +1,13 @@
+# ── QuantizationConfig: sub-config of ModelConfig ────────────────────────────
+#
+# Scope:  describes the quantization scheme used by the model weights.
+#         Controls which weight loader is used (AWQ vs BF16) and how
+#         linear layers are constructed (AWQLinear vs nn.Linear).
+# Owner:  Embedded in ModelConfig.quantization. Only meaningful when
+#         is_quantized() is True — otherwise the engine ignores it.
+# Source: Auto-generated from HF config.json → QuantizationConfig.from_hf_config().
+# Frozen: yes.
+
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
