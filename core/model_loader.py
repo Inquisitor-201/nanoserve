@@ -69,9 +69,10 @@ class ModelLoader:
                 return shard[0]
             raise
 
-    # Regex for stacked param names:  {path}.{q,k,v}_proj.{weight,bias}
+    # Regex for stacked param names:  {path}.{q,k,v}_proj.{suffix}
+    # Handles nn.Linear (weight/bias) and AWQ (qweight/qzeros/scales).
     _STACKED_PARAM_RE = re.compile(
-        r"^(.*\.self_attn)\.([qkv])_proj\.(weight|bias)$"
+        r"^(.*\.self_attn)\.([qkv])_proj\.(weight|bias|qweight|qzeros|scales)$"
     )
 
     @staticmethod
@@ -97,10 +98,21 @@ class ModelLoader:
 
         offset, size = shard_info[shard_id]
         fused_name = f"{module_path}.qkv_proj.{suffix}"
-        fused_param = model.get_parameter(fused_name)
 
-        # Narrow to the correct slice on dim 0
-        view = fused_param.narrow(0, offset, size)
+        # ── Pick the right narrow dim and packing factor ──────────
+        # nn.Linear.weight/bias  →  dim 0 = out_features
+        # AWQ qweight/qzeros     →  dim 1 = packed out_features (×1/8)
+        # AWQ scales             →  dim 1 = out_features (no pack)
+        if suffix in ("weight", "bias"):
+            fused_param = model.get_parameter(fused_name)
+            view = fused_param.narrow(0, offset, size)
+        elif suffix == "scales":
+            fused_param = model.get_buffer(fused_name)
+            view = fused_param.narrow(1, offset, size)
+        else:  # qweight, qzeros — packed int4
+            fused_param = model.get_buffer(fused_name)
+            pack_factor = 8  # 32 bits ÷ 4 bits
+            view = fused_param.narrow(1, offset // pack_factor, size // pack_factor)
         return (view, offset)
 
     @staticmethod
