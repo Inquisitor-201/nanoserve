@@ -125,7 +125,6 @@ def Linear(
     out_features: int,
     *,
     quantization: Optional["QuantizationConfig"] = None,
-    bias: bool = False,
     device: Optional[str] = None,
     dtype: Optional[torch.dtype] = None,
 ) -> nn.Module:
@@ -137,4 +136,4 @@ def Linear(
             device=device, dtype=dtype,
             bits=quantization.bits, group_size=quantization.group_size,
         )
-    return nn.Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
+    return nn.Linear(in_features, out_features, bias=False, device=device, dtype=dtype)

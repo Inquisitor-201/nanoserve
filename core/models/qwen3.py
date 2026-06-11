@@ -102,7 +102,6 @@ class Qwen3Model(nn.Module):
                 num_key_value_heads=num_key_value_heads,
                 rope_theta=rope_theta,
                 rms_norm_eps=rms_norm_eps,
-                bias=False,
                 device=device,
                 dtype=dtype,
                 quantization=quantization,

@@ -18,16 +18,15 @@ class Qwen3MLP(nn.Module):
         self,
         hidden_size: int,
         intermediate_size: int,
-        bias: bool = False,
         device: str = None,
         dtype = None,
         quantization: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
 
-        self.gate_proj = Linear(hidden_size, intermediate_size, quantization=quantization, bias=bias, device=device, dtype=dtype)
-        self.up_proj = Linear(hidden_size, intermediate_size, quantization=quantization, bias=bias, device=device, dtype=dtype)
-        self.down_proj = Linear(intermediate_size, hidden_size, quantization=quantization, bias=bias, device=device, dtype=dtype)
+        self.gate_proj = Linear(hidden_size, intermediate_size, quantization=quantization, device=device, dtype=dtype)
+        self.up_proj = Linear(hidden_size, intermediate_size, quantization=quantization, device=device, dtype=dtype)
+        self.down_proj = Linear(intermediate_size, hidden_size, quantization=quantization, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
