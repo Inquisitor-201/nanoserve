@@ -3,7 +3,8 @@ from typing import Optional
 from pathlib import Path
 import torch
 import logging
-from transformers import AutoConfig
+
+from .quantization.config import QuantizationConfig
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,7 @@ class ModelConfig:
     vocab_size: Optional[int] = None
     intermediate_size: Optional[int] = None
     num_layers: Optional[int] = None
+    quantization: QuantizationConfig = QuantizationConfig()
 
     @classmethod
     def from_hf(
@@ -117,18 +119,18 @@ class ModelConfig:
     ) -> "ModelConfig":
         """
         Load model parameters from HuggingFace configuration.
-        
+
         Args:
             model_path: Model path
             dtype: Data type
-            
+
         Returns:
             ModelConfig object
         """
         from transformers import AutoConfig
-        
+
         hf_config = AutoConfig.from_pretrained(model_path)
-        
+
         hidden_size = getattr(hf_config, 'hidden_size', 4096)
         num_heads = getattr(hf_config, 'num_attention_heads', 32)
         num_key_value_heads = getattr(hf_config, 'num_key_value_heads', None)
@@ -137,10 +139,11 @@ class ModelConfig:
         intermediate_size = getattr(hf_config, 'intermediate_size', None)
         num_layers = getattr(hf_config, 'num_hidden_layers', None)
         rope_theta = getattr(hf_config, 'rope_theta', 1000000.0)
-        
+        quantization = QuantizationConfig.from_hf_config(hf_config)
+
         if num_key_value_heads is None:
             num_key_value_heads = num_heads
-        
+
         return cls(
             num_heads=num_heads,
             num_key_value_heads=num_key_value_heads,
@@ -151,6 +154,7 @@ class ModelConfig:
             vocab_size=vocab_size,
             intermediate_size=intermediate_size,
             num_layers=num_layers,
+            quantization=quantization,
         )
 
     def to_dict(self) -> dict:
@@ -164,6 +168,7 @@ class ModelConfig:
             "vocab_size": self.vocab_size,
             "intermediate_size": self.intermediate_size,
             "num_layers": self.num_layers,
+            "quantization": self.quantization.to_dict() if self.quantization.is_quantized() else None,
         }
 
     @classmethod
@@ -219,33 +224,7 @@ class EngineArgs:
 
     def create_engine_configs(self):
         """Create engine configs from EngineArgs."""
-        from transformers import AutoConfig
-        
-        hf_config = AutoConfig.from_pretrained(self.model_path)
-        
-        hidden_size = getattr(hf_config, 'hidden_size', 4096)
-        num_heads = getattr(hf_config, 'num_attention_heads', 32)
-        num_key_value_heads = getattr(hf_config, 'num_key_value_heads', None)
-        head_dim = getattr(hf_config, 'head_dim', hidden_size // num_heads)
-        vocab_size = getattr(hf_config, 'vocab_size', 32000)
-        intermediate_size = getattr(hf_config, 'intermediate_size', None)
-        num_layers = getattr(hf_config, 'num_hidden_layers', None)
-        rope_theta = getattr(hf_config, 'rope_theta', 1000000.0)
-        
-        if num_key_value_heads is None:
-            num_key_value_heads = num_heads
-        
-        model_config = ModelConfig(
-            num_heads=num_heads,
-            num_key_value_heads=num_key_value_heads,
-            head_dim=head_dim,
-            hidden_size=hidden_size,
-            rope_theta=rope_theta,
-            dtype=self.dtype,
-            vocab_size=vocab_size,
-            intermediate_size=intermediate_size,
-            num_layers=num_layers,
-        )
+        model_config = ModelConfig.from_hf(self.model_path, self.dtype)
         
         cache_config = CacheConfig(
             num_blocks=self.num_blocks,
