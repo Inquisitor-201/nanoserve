@@ -107,6 +107,7 @@ class ModelConfig:
     head_dim: int
     hidden_size: int
     rope_theta: float
+    rms_norm_eps: float
     dtype: torch.dtype
     vocab_size: int
     intermediate_size: int
@@ -132,6 +133,7 @@ class ModelConfig:
         intermediate_size = getattr(hf_config, "intermediate_size")
         num_layers = getattr(hf_config, "num_hidden_layers")
         rope_theta = getattr(hf_config, "rope_theta", 1000000.0)
+        rms_norm_eps = getattr(hf_config, "rms_norm_eps", 1e-6)
         dtype = getattr(hf_config, "torch_dtype", torch.bfloat16)
         quantization = QuantizationConfig.from_hf_config(hf_config)
 
@@ -141,6 +143,7 @@ class ModelConfig:
             head_dim=head_dim,
             hidden_size=hidden_size,
             rope_theta=rope_theta,
+            rms_norm_eps=rms_norm_eps,
             dtype=dtype,
             vocab_size=vocab_size,
             intermediate_size=intermediate_size,
@@ -155,6 +158,7 @@ class ModelConfig:
             "head_dim": self.head_dim,
             "hidden_size": self.hidden_size,
             "rope_theta": self.rope_theta,
+            "rms_norm_eps": self.rms_norm_eps,
             "dtype": self.dtype,
             "vocab_size": self.vocab_size,
             "intermediate_size": self.intermediate_size,

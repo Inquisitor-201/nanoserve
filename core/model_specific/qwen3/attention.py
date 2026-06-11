@@ -41,6 +41,7 @@ class Qwen3Attention(nn.Module):
         layer_idx: int,
         num_key_value_heads: int,
         rope_theta,
+        rms_norm_eps: float = 1e-6,
         bias: bool = False,
         device: str = None,
         dtype = None,
@@ -68,10 +69,10 @@ class Qwen3Attention(nn.Module):
         self.k_proj = Linear(hidden_size, num_key_value_heads * head_dim, quantization=quantization, bias=bias, device=device, dtype=dtype)
         self.v_proj = Linear(hidden_size, num_key_value_heads * head_dim, quantization=quantization, bias=bias, device=device, dtype=dtype)
         self.o_proj = Linear(num_heads * head_dim, hidden_size, quantization=quantization, bias=bias, device=device, dtype=dtype)
-        
+
         # QK normalization (specific to Qwen3)
-        self.q_norm = nn.RMSNorm(head_dim, eps=1e-6, device=device, dtype=dtype)
-        self.k_norm = nn.RMSNorm(head_dim, eps=1e-6, device=device, dtype=dtype)
+        self.q_norm = nn.RMSNorm(head_dim, eps=rms_norm_eps, device=device, dtype=dtype)
+        self.k_norm = nn.RMSNorm(head_dim, eps=rms_norm_eps, device=device, dtype=dtype)
         
         # Backend run operation
         self._run_op = partial(
@@ -183,6 +184,7 @@ class Qwen3DecoderLayer(nn.Module):
             attention_backend=attention_backend,
             layer_idx=layer_idx,
             rope_theta=rope_theta,
+            rms_norm_eps=rms_norm_eps,
             bias=bias,
             device=device,
             dtype=dtype,

@@ -82,6 +82,7 @@ class ModelExecutor:
                 device=self.device,
                 kv_cache_pool=self.kv_cache_pool,
                 rope_theta=model_config.rope_theta,
+                rms_norm_eps=model_config.rms_norm_eps,
                 block_size=cache_config.block_size,
                 quantization=model_config.quantization,
             )

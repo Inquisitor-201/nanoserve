@@ -46,6 +46,7 @@ class Qwen3Model(nn.Module):
         device: str,
         kv_cache_pool: torch.Tensor,
         rope_theta: float,
+        rms_norm_eps: float,
         block_size: int,
         quantization: Optional[QuantizationConfig] = None,
     ):
@@ -100,7 +101,7 @@ class Qwen3Model(nn.Module):
                 layer_idx=layer_idx,
                 num_key_value_heads=num_key_value_heads,
                 rope_theta=rope_theta,
-                rms_norm_eps=1e-6,
+                rms_norm_eps=rms_norm_eps,
                 bias=False,
                 device=device,
                 dtype=dtype,
@@ -110,7 +111,7 @@ class Qwen3Model(nn.Module):
         ])
         
         # Final layer norm (generic)
-        self.norm = nn.RMSNorm(hidden_size, eps=1e-6, device=device, dtype=dtype)
+        self.norm = nn.RMSNorm(hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
         
         # LM Head
         self.lm_head = nn.Linear(
