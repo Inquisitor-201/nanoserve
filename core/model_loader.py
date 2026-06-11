@@ -8,13 +8,11 @@ import logging
 import torch
 from safetensors.torch import load_file
 
-from .quantization import AWQLinear
-
 logger = logging.getLogger(__name__)
 
 
 class ModelLoader:
-    """Load model weights from disk and handle post-processing."""
+    """Load model weights from disk into a model instance."""
 
     @staticmethod
     def load_weights(
@@ -26,8 +24,8 @@ class ModelLoader:
         """Load weights from a safetensors file into *model*.
 
         Works for both plain (BF16) and quantised (AWQ) models.  For quantised
-        models the caller **must** call :meth:`post_process_awq` after this
-        returns.
+        models the weight stays in int4 format — the fused CUDA kernel
+        dequantises on the fly during forward.
         """
         logger.info(f"Loading model weights from {model_path}")
 
@@ -55,21 +53,6 @@ class ModelLoader:
                 model_param.copy_(param)
 
         logger.info("Successfully loaded model weights")
-
-    @staticmethod
-    def post_process_awq(model: torch.nn.Module) -> None:
-        """Dequantise every :class:`AWQLinear` module in *model* in-place.
-
-        Must be called after all AWQ weights have been loaded into their
-        raw buffers.
-        """
-        count = 0
-        for module in model.modules():
-            if isinstance(module, AWQLinear):
-                module.dequantize_()
-                count += 1
-        if count:
-            logger.info(f"Dequantised {count} AWQLinear modules")
 
     @staticmethod
     def _map_weight_name(hf_name: str) -> str:

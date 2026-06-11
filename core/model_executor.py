@@ -94,8 +94,6 @@ class ModelExecutor:
                     self.dtype,
                     self.device,
                 )
-                if model_config.quantization:
-                    ModelLoader.post_process_awq(self.model)
 
         else:
             raise ValueError(f"Unsupported model: {model_name}")
