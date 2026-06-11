@@ -94,8 +94,8 @@ class SamplingConfig:
 #         weight layout.
 # Owner:  One per LLMService instance. Created from HF config.json at startup.
 # Source: ModelConfig.from_hf(model_path) — reads HuggingFace AutoConfig.
-#         The dtype field is read from HF config's ``torch_dtype`` (caller
-#         can override via the optional ``dtype`` parameter).
+#         dtype is determined by the model's ``torch_dtype`` — never
+#         user-configurable (mismatched precision silently degrades).
 # Sub-config: quantization (QuantizationConfig | None) — present only when
 #         the model weights are quantized (AWQ / GPTQ).
 # Frozen: yes — must match the loaded weights exactly.
@@ -114,15 +114,11 @@ class ModelConfig:
     quantization: Optional[QuantizationConfig] = None
 
     @classmethod
-    def from_hf(
-        cls,
-        model_path: str,
-        dtype: Optional[torch.dtype] = None,
-    ) -> "ModelConfig":
+    def from_hf(cls, model_path: str) -> "ModelConfig":
         """Load model architecture from HuggingFace ``config.json``.
 
-        When ``dtype`` is ``None`` (the default), the model's native
-        ``torch_dtype`` from ``config.json`` is used.
+        ``dtype`` is read from the model's ``torch_dtype`` field — callers
+        must not override it (mismatched precision silently degrades quality).
         """
         from transformers import AutoConfig
 
@@ -136,8 +132,7 @@ class ModelConfig:
         intermediate_size = getattr(hf_config, "intermediate_size")
         num_layers = getattr(hf_config, "num_hidden_layers")
         rope_theta = getattr(hf_config, "rope_theta", 1000000.0)
-        if dtype is None:
-            dtype = getattr(hf_config, "torch_dtype", torch.bfloat16)
+        dtype = getattr(hf_config, "torch_dtype", torch.bfloat16)
         quantization = QuantizationConfig.from_hf_config(hf_config)
 
         return cls(
@@ -232,7 +227,7 @@ class SchedulerConfig:
 # Frozen: yes.
 #
 # Fields → derived configs:
-#   model_path        → ModelConfig.from_hf(model_path)
+#   model_path        → ModelConfig.from_hf(model_path)  (dtype from model)
 #   block_size        → CacheConfig.block_size
 #   num_blocks        → CacheConfig.num_blocks  (None = auto-calculate)
 #   device            → CacheConfig.device
