@@ -54,6 +54,7 @@ class LLMService:
                 num_layers=model_config.num_layers,
                 num_kv_heads=model_config.num_key_value_heads,
                 head_dim=model_config.head_dim,
+                model_config=model_config,
             )
 
         # 3. Build derived configs
@@ -92,7 +93,7 @@ class LLMService:
 
         # 7. Initialize Scheduler
         self.scheduler = Scheduler(scheduler_config, self.block_manager)
-    
+
     def add_requests(
         self,
         prompts: Union[str, List[str], List[List[int]]],
@@ -158,28 +159,45 @@ class LLMService:
     ) -> List[str]:
         """
         Optimized main loop: orchestrates scheduling and execution.
-        
+
         Args:
             request_ids: List of request IDs
             sampling_config: SamplingConfig object
         """
+        step = 0
+        max_steps = sampling_config.max_new_tokens + 5  # +5 for prefill steps
+        log_interval = max(1, max_steps // 20)  # ~5% intervals
+
         while self.scheduler.has_unfinished_requests():
             sched_output = self.scheduler.schedule()
-            
+
             if not sched_output.scheduled_requests:
                 raise RuntimeError("No requests scheduled. This should not happen.")
-            
+
             sampled_tokens = self._run_inference_step(
                 sched_output, sampling_config
             )
-            
+
             # 3. Update scheduler with results
             # Wrap tokens in tensors to match your optimized scheduler's expected input
             new_tokens = [t.view(1) for t in sampled_tokens]
             active_ids = [req.request_id for req in sched_output.scheduled_requests]
-            
+
             self.scheduler.update_running_requests(new_tokens, active_ids)
+            step += 1
+
+            # Log progress periodically
+            if step % log_interval == 0 or step == 1:
+                n_running = len(self.scheduler.running_list)
+                n_waiting = len(self.scheduler.waiting_list)
+                n_done = len(self.scheduler.completed_requests)
+                pct = min(step / max_steps * 100, 99)
+                logger.info(
+                    f"  Step {step}/{max_steps} ({pct:.0f}%) | "
+                    f"running={n_running} waiting={n_waiting} done={n_done}"
+                )
         # 4. Final output collection
+        logger.info(f"Generation complete in {step} steps")
         return self._collect_results(request_ids)
 
     def _run_inference_step(self, sched_output, sampling_config: SamplingConfig):
@@ -243,12 +261,28 @@ class LLMService:
         )
 
         cfg = sampling_config[0] if isinstance(sampling_config, list) else sampling_config
+
+        # Log progress info
+        n_reqs = len(request_ids)
+        max_tokens = cfg.max_new_tokens
+        logger.info(
+            f"Starting generation: {n_reqs} request(s), "
+            f"max_new_tokens={max_tokens}, "
+            f"estimated ~{max_tokens * self._estimate_itl():.0f}s total"
+        )
+
         generated_texts = self.main_loop(
             request_ids=request_ids,
             sampling_config=cfg
         )
 
         return generated_texts
+
+    def _estimate_itl(self) -> float:
+        """Rough estimate of inter-token latency based on model size."""
+        h = self.model_config.hidden_size
+        # Empirical: 0.6B (h=1024) ~25ms, 1.7B (h=2048) ~46ms
+        return 0.025 * (h / 1024) ** 0.8
     
     def execute_prefill(
         self,

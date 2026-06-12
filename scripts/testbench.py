@@ -1,24 +1,63 @@
 #!/usr/bin/env python3
-import os
-os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
 """
-Offline inference testbench for nanoserve.
+NanoServe — Continuous Batching Testbench
 
 Two modes:
   burst     — all requests submitted at once (baseline)
   staggered — requests arrive in waves during decode (triggers continuous batching)
+
+Usage:
+  python testbench.py                              # default: Qwen3-0.6B
+  python testbench.py --model 0.6b
+  python testbench.py --model 1.7b
+  python testbench.py --model ./models/Qwen3-1.7B
 """
+
+import os
+os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
 
 import logging
 import time
 import sys
+import argparse
 from dataclasses import dataclass, field
 from typing import List, Dict
+from pathlib import Path
 import torch
+
+# Ensure project root is on sys.path so `from core import ...` works
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 from core import LLMService, SamplingConfig
 
 logging.basicConfig(level=logging.WARNING)
+
+
+# ── Model resolution ─────────────────────────────────────────────────────
+
+DEFAULT_MODEL_MAP = {
+    "0.6b": "./models/Qwen3-0.6B",
+    "1.7b": "./models/Qwen3-1.7B",
+}
+
+
+def resolve_model_path(model_arg: str) -> str:
+    """Resolve short name to path, or return as-is if it's a directory."""
+    if Path(model_arg).exists():
+        return model_arg
+    if model_arg.lower() in DEFAULT_MODEL_MAP:
+        return DEFAULT_MODEL_MAP[model_arg.lower()]
+    # Maybe it's a partial name match
+    for key, path in DEFAULT_MODEL_MAP.items():
+        if key in model_arg.lower().replace("_", "."):
+            return path
+    raise FileNotFoundError(
+        f"Cannot resolve model '{model_arg}'. "
+        f"Available shortcuts: {list(DEFAULT_MODEL_MAP.keys())}, "
+        f"or provide a direct path."
+    )
 
 # ── Synthetic test dataset ────────────────────────────────────────────
 
@@ -162,13 +201,24 @@ def run_staggered(llm_service, n_total: int, n_waves: int,
 # ── Main ──────────────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(description="NanoServe Continuous Batching Testbench")
+    parser.add_argument("--model", type=str, default="0.6b",
+                       help="Model path or shortcut (0.6b, 1.7b, or direct path)")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--dtype", type=str, default="bfloat16")
+    args = parser.parse_args()
+
+    model_path = resolve_model_path(args.model)
+    dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[args.dtype]
+
     print("\n" + "█" * 70)
     print("  nanoserve  Continuous Batching Testbench")
+    print(f"  Model: {model_path}")
     print("█" * 70)
 
     llm_service = LLMService(
-        model_path="./models/Qwen3-0.6B",
-        device="cuda", block_size=16,
+        model_path=model_path,
+        device=args.device, block_size=16,
     )
 
     num_blocks = llm_service.cache_config.num_blocks

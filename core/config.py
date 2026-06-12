@@ -18,13 +18,29 @@ def auto_calculate_num_blocks(
     num_layers: int,
     num_kv_heads: int,
     head_dim: int,
+    model_config: Optional["ModelConfig"] = None,
     safety_factor: float = 0.65,
     min_blocks: int = 64,
     max_blocks: int = 10000,
 ) -> int:
     """
     Automatically calculate the optimal number of KV cache blocks
-    based on available GPU memory.
+    based on available GPU memory, accounting for model weight size.
+
+    Args:
+        device: Target device (e.g. "cuda")
+        dtype: KV cache data type
+        block_size: Tokens per block
+        num_layers: Number of transformer layers
+        num_kv_heads: Number of key-value heads
+        head_dim: Dimension per attention head
+        model_config: Optional ModelConfig to estimate model weight memory
+        safety_factor: Fraction of remaining GPU memory available for KV cache
+        min_blocks: Minimum allowed blocks
+        max_blocks: Maximum allowed blocks
+
+    Returns:
+        Calculated number of blocks
     """
     if device != "cuda" or not torch.cuda.is_available():
         logger.info("CUDA not available, using default 256 blocks")
@@ -46,28 +62,67 @@ def auto_calculate_num_blocks(
         logger.warning("Invalid per-block size calculation, using default 256 blocks")
         return 256
 
-    available = int(total_memory * safety_factor)
-    blocks = available // bytes_per_block
+    # Estimate model weight memory if config is provided
+    estimated_model_memory = 0
+    if model_config is not None:
+        estimated_model_memory = _estimate_model_memory(model_config)
+
+    available_for_kv = int((total_memory - estimated_model_memory) * safety_factor)
+    blocks = available_for_kv // bytes_per_block
     blocks = max(min_blocks, min(blocks, max_blocks))
 
     total_gib = total_memory / (1024 ** 3)
+    model_gib = estimated_model_memory / (1024 ** 3)
     kv_gib = (blocks * bytes_per_block) / (1024 ** 3)
     logger.info(
         f"Auto-calculated num_blocks={blocks} "
-        f"(GPU: {total_gib:.1f} GiB, KV cache: {kv_gib:.2f} GiB, "
-        f"{safety_factor*100:.0f}% utilization)"
+        f"(GPU: {total_gib:.1f} GiB, model~{model_gib:.2f} GiB, "
+        f"KV cache: {kv_gib:.2f} GiB, {safety_factor*100:.0f}% of remaining)"
     )
     return blocks
 
 
-# ── SamplingConfig: per-request ──────────────────────────────────────────────
-#
-# Scope:  how a single generation request samples output tokens.
-# Owner:  attached to each Request in the scheduler.
-#         Different requests can have different SamplingConfigs.
-# Source: user-provided (API). All fields required — no defaults.
-# Frozen: yes.
-#
+def _estimate_model_memory(config: "ModelConfig") -> int:
+    """Roughly estimate model weight memory in bytes (for KV cache planning)."""
+    # Embedding + LM Head
+    vocab = config.vocab_size or 151936
+    h = config.hidden_size
+    embed = 2 * vocab * h  # embed_tokens + lm_head (if not tied)
+
+    # Layers
+    n_layers = config.num_layers or 28
+    kv_heads = config.num_key_value_heads or config.num_heads
+    n_heads = config.num_heads
+    head_dim = config.head_dim or (h // n_heads)
+    intermediate = config.intermediate_size or (4 * h)
+
+    # Attention: QKV + O projections
+    attn_per_layer = (
+        n_heads * head_dim * h  # q_proj
+        + kv_heads * head_dim * h  # k_proj
+        + kv_heads * head_dim * h  # v_proj
+        + n_heads * head_dim * h  # o_proj
+    )
+    # QK norms
+    norms_per_layer = n_heads * head_dim + kv_heads * head_dim  # q_norm + k_norm
+
+    # MLP: gate + up + down
+    mlp_per_layer = 3 * h * intermediate
+
+    # Layer norms
+    layer_norms = 2 * h  # input + post_attention
+
+    layer_total = attn_per_layer + mlp_per_layer + layer_norms + norms_per_layer
+    layers = layer_total * n_layers
+
+    # Final norm
+    final_norm = h
+
+    total_params = embed + layers + final_norm
+    bytes_per_param = torch.tensor([], dtype=config.dtype).element_size()
+    return total_params * bytes_per_param
+
+
 @dataclass(frozen=True)
 class SamplingConfig:
     temperature: float
@@ -113,13 +168,14 @@ class ModelConfig:
     vocab_size: int
     intermediate_size: int
     num_layers: int
+    tie_word_embeddings: bool = False
     quantization: Optional[QuantizationConfig] = None
 
     @classmethod
     def from_hf(cls, model_path: str) -> "ModelConfig":
         """Load model architecture from HuggingFace ``config.json``.
 
-        ``dtype`` is read from the model's ``torch_dtype`` field — callers
+        ``dtype`` is read from the model's ``torch_dtype`` field -- callers
         must not override it (mismatched precision silently degrades quality).
         """
         from transformers import AutoConfig
@@ -136,6 +192,7 @@ class ModelConfig:
         rope_theta = getattr(hf_config, "rope_theta", 1000000.0)
         rms_norm_eps = getattr(hf_config, "rms_norm_eps", 1e-6)
         dtype = getattr(hf_config, "torch_dtype", torch.bfloat16)
+        tie_word_embeddings = getattr(hf_config, "tie_word_embeddings", False)
         quantization = QuantizationConfig.from_hf_config(hf_config)
 
         return cls(
@@ -149,6 +206,7 @@ class ModelConfig:
             vocab_size=vocab_size,
             intermediate_size=intermediate_size,
             num_layers=num_layers,
+            tie_word_embeddings=tie_word_embeddings,
             quantization=quantization,
         )
 

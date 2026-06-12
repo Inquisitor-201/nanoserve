@@ -93,6 +93,7 @@ class ModelExecutor:
                     model_path,
                     self.dtype,
                     self.device,
+                    tie_word_embeddings=model_config.tie_word_embeddings,
                 )
 
         else:

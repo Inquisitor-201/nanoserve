@@ -1,11 +1,15 @@
 """
 Model weight loader module.
+Responsible for loading model weights from disk and mapping them to model structure.
+Supports both single-file and sharded safetensors, as well as AWQ quantized weights.
 """
 
-from typing import Optional, Tuple
+from typing import Dict, Any, Optional, List, Set, Tuple
 import os
+import json
 import re
 import logging
+import glob
 import torch
 from safetensors.torch import load_file
 
@@ -13,7 +17,10 @@ logger = logging.getLogger(__name__)
 
 
 class ModelLoader:
-    """Load model weights from disk into a model instance."""
+    """
+    Model weight loader for loading and mapping weights from disk to model.
+    Supports HuggingFace safetensors format (single & sharded) and AWQ quantized weights.
+    """
 
     @staticmethod
     def load_weights(
@@ -21,37 +28,110 @@ class ModelLoader:
         model_path: str,
         dtype: torch.dtype,
         device: str,
+        tie_word_embeddings: bool = False,
     ) -> None:
-        """Load weights from a safetensors file into *model*.
+        """Load weights from safetensors file(s) into *model*.
 
-        Works for both plain (BF16) and quantised (AWQ) models.  For quantised
-        models the weight stays in int4 format — the fused CUDA kernel
+        Supports single-file, sharded (model-00001-of-N), and AWQ quantised formats.
+        For quantised models the weight stays in int4 format — the fused CUDA kernel
         dequantises on the fly during forward.
         """
         logger.info(f"Loading model weights from {model_path}")
 
-        model_file = os.path.join(model_path, "model.safetensors")
-        if not os.path.exists(model_file):
-            raise FileNotFoundError(f"Model file not found: {model_file}")
+        # Find all safetensor files (single or sharded)
+        safetensor_files = ModelLoader._find_safetensor_files(model_path)
+        if not safetensor_files:
+            raise FileNotFoundError(
+                f"No safetensors model files found in {model_path}. "
+                f"Expected model.safetensors or model-*.safetensors"
+            )
 
-        state_dict = load_file(model_file)
-        logger.info(f"Loaded {len(state_dict)} parameters from {model_file}")
+        logger.info(f"Found {len(safetensor_files)} safetensor file(s)")
+        for f in safetensor_files:
+            fsize = os.path.getsize(f)
+            logger.debug(f"  {os.path.basename(f)} ({fsize / 1e9:.2f} GB)")
 
-        for hf_name, param in state_dict.items():
-            mapped_name = ModelLoader._map_weight_name(hf_name)
+        loaded_keys: Set[str] = set()
+        missing_keys: List[str] = []
 
-            # Resolve param (handles fused QKV shards), fall back to buffer (AWQ qweight etc.)
-            try:
-                model_param = ModelLoader._resolve_param(model, mapped_name)
-            except AttributeError:
-                model_param = model.get_buffer(mapped_name)
+        for file_path in safetensor_files:
+            logger.info(f"Loading {os.path.basename(file_path)}...")
+            state_dict = load_file(file_path)
 
-            if param.dtype != model_param.dtype:
-                param = param.to(model_param.dtype)
+            for hf_name, param in state_dict.items():
+                mapped_name = ModelLoader._map_weight_name(hf_name)
+
+                # Resolve param (handles fused QKV shards), fall back to buffer (AWQ qweight etc.)
+                try:
+                    model_param = ModelLoader._resolve_param(model, mapped_name)
+                except AttributeError:
+                    model_param = model.get_buffer(mapped_name)
+
+                if param.dtype != model_param.dtype:
+                    param = param.to(model_param.dtype)
+                with torch.no_grad():
+                    model_param.copy_(param)
+
+                loaded_keys.add(mapped_name)
+
+        # Handle tied embeddings
+        if tie_word_embeddings and 'lm_head.weight' not in loaded_keys:
+            logger.info(
+                "tie_word_embeddings=True and lm_head.weight not found in files. "
+                "Copying from embed_tokens.weight."
+            )
             with torch.no_grad():
-                model_param.copy_(param)
+                model.lm_head.weight.data.copy_(model.embed_tokens.weight.data)
+            loaded_keys.add('lm_head.weight')
 
-        logger.info("Successfully loaded model weights")
+        # Report loading summary
+        total_params = sum(p.numel() for p in model.parameters() if p is not None)
+        loaded_params = sum(
+            model.get_parameter(k).numel() for k in loaded_keys if hasattr(model, k) or any(
+                p_name == k for p_name, _ in model.named_parameters()
+            )
+        )
+        logger.info(
+            f"Successfully loaded {len(loaded_keys)} parameter tensors"
+        )
+        if missing_keys:
+            logger.warning(f"Missing {len(missing_keys)} keys: {missing_keys[:5]}...")
+
+    @staticmethod
+    def _find_safetensor_files(model_path: str) -> List[str]:
+        """
+        Find safetensors model files, handling both single and sharded formats.
+
+        Resolution order:
+        1. model.safetensors (single file)
+        2. model.safetensors.index.json (sharded index)
+        3. model-*.safetensors glob (fallback)
+        """
+        # Case 1: Single file
+        single_file = os.path.join(model_path, "model.safetensors")
+        if os.path.exists(single_file):
+            return [single_file]
+
+        # Case 2: Sharded with index file
+        index_file = os.path.join(model_path, "model.safetensors.index.json")
+        if os.path.exists(index_file):
+            with open(index_file, 'r') as f:
+                index_data = json.load(f)
+            weight_map = index_data.get('weight_map', {})
+
+            file_set: Set[str] = set()
+            for fname in weight_map.values():
+                file_set.add(os.path.join(model_path, fname))
+
+            if file_set:
+                return sorted(file_set)
+
+        # Case 3: Glob fallback
+        shard_files = sorted(glob.glob(os.path.join(model_path, "model-*.safetensors")))
+        if shard_files:
+            return shard_files
+
+        return []
 
     @staticmethod
     def _resolve_param(model: torch.nn.Module, name: str) -> torch.Tensor:
