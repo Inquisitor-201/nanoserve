@@ -1,20 +1,15 @@
 """
-Qwen3 model implementation using the decoupled architecture.
-
-This module demonstrates the clean separation between:
-- Generic layers (layers.py): RMSNorm, Embedding, Linear
-- Model-specific implementations (model_specific/qwen3/): Qwen3Attention, Qwen3MLP
-- Backend (backends/): FlashInfer for efficient attention computation
+Qwen3 model implementation.
 """
 
-from typing import Optional, List, Tuple
+from typing import Optional
 import torch
 import torch.nn as nn
 
-from ..layers_utils import Embedding
-from ..backends import AttentionMetadata, FlashInferBackend, TorchBackend
-from ..model_specific.qwen3.attention import Qwen3DecoderLayer
-from ..quantization import QuantizationConfig
+from ...layers_utils import Embedding
+from ...backends import AttentionMetadata, FlashInferBackend, TorchBackend
+from ...quantization import QuantizationConfig
+from .attention import Qwen3DecoderLayer
 
 
 class Qwen3Model(nn.Module):
@@ -167,39 +162,3 @@ class Qwen3Model(nn.Module):
         logits = self.lm_head(hidden_states)
 
         return logits
-
-
-class Qwen3ForCausalLM(nn.Module):
-    """
-    Qwen3 model for causal language modeling.
-    
-    Wraps the base model with LM head for easy generation.
-    """
-    
-    def __init__(self, model: Qwen3Model):
-        """
-        Initialize with a Qwen3Model.
-        
-        Args:
-            model: Qwen3Model instance
-        """
-        super().__init__()
-        self.model = model
-        self.lm_head = model.lm_head
-    
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        metadata: AttentionMetadata
-    ) -> torch.Tensor:
-        """
-        Forward pass.
-        
-        Args:
-            input_ids: Input token IDs
-            metadata: Attention metadata
-            
-        Returns:
-            Logits tensor
-        """
-        return self.model(input_ids, metadata)

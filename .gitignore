@@ -16,7 +16,7 @@ __pycache__/
 .trae/
 
 # Models directory (if used locally)
-models/
+/models/
 
 build/
 *.egg-info
