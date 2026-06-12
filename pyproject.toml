@@ -17,11 +17,12 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "torch==2.4.0",
-    "flashinfer-python==0.6.3",
+    "torch>=2.4.0",
+    "flashinfer-python>=0.6.3",
     "safetensors>=0.4.0",
     "huggingface_hub>=0.19.0",
-    "transformers>=5.3.0"
+    "transformers>=5.3.0",
+    "modelscope>=1.0.0"
 ]
 
 [build-system]
@@ -31,4 +32,4 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["core*", "chatbot*"]
-exclude = ["tests*"]
+exclude = ["test*"]

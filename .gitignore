@@ -20,3 +20,6 @@ __pycache__/
 
 build/
 *.egg-info
+
+# Project instructions (not for distribution)
+CLAUDE.md
