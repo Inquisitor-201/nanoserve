@@ -121,10 +121,9 @@ class Qwen3Attention(nn.Module):
         Args:
             hidden_states: Input hidden states (flattened 2D: [total_tokens, hidden_size])
             metadata: Attention metadata for backend (required for actual attention computation)
-            return_debug_info: Whether to return intermediate debug information
-            
+
         Returns:
-            Output hidden states of same shape, or tuple with debug info if return_debug_info=True
+            Output hidden states of same shape
         """
         total_tokens, _ = hidden_states.shape
 
@@ -232,9 +231,8 @@ class Qwen3DecoderLayer(nn.Module):
         
         Args:
             hidden_states: Input hidden states
-            metadata: Attention metadata (optional, but required for attention computation)
-            return_debug_info: Whether to return intermediate debug information
-            
+            metadata: Attention metadata
+
         Returns:
             Output hidden states
         """

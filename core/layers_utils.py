@@ -100,26 +100,6 @@ class Embedding(nn.Module):
         return F.embedding(x, self.weight)
 
 
-class GELU(nn.Module):
-    """
-    Gaussian Error Linear Unit activation.
-    
-    Used in transformer feed-forward networks.
-    """
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Apply GELU activation.
-        
-        Args:
-            x: Input tensor
-            
-        Returns:
-            Activated tensor
-        """
-        return F.gelu(x, approximate='tanh')
-
-
 def Linear(
     in_features: int,
     out_features: int,

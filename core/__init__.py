@@ -4,7 +4,7 @@ Contains models, layers, backends, and utilities for efficient inference.
 """
 
 from .backends import AttentionMetadata, FlashInferBackend
-from .layers_utils import RMSNorm, Embedding, Linear, GELU
+from .layers_utils import RMSNorm, Embedding, Linear
 from .models import Qwen3Model
 from .model_executor import ModelExecutor
 from .block_manager import BlockManager
@@ -17,7 +17,6 @@ __all__ = [
     "RMSNorm",
     "Embedding",
     "Linear",
-    "GELU",
     "Qwen3Model",
     "ModelExecutor",
     "BlockManager",

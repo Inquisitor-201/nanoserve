@@ -131,19 +131,10 @@ class Qwen3Model(nn.Module):
         
         Args:
             input_ids: Input token IDs (flattened: [total_tokens])
-            attention_mask: Attention mask (optional)
-            position_ids: Position IDs (optional)
-            past_key_values: Past KV cache (optional)
-            use_cache: Whether to return KV cache for generation
-            cache_position: Cache position tensor (optional)
-            position_embeddings: Precomputed position embeddings (optional)
-            metadata: Attention metadata for paged attention (required for our backend)
-            return_debug_info: Whether to return intermediate debug information
-            debug_layer_idx: Which layer to return debug info from (if return_debug_info=True)
-            **kwargs: Additional arguments
-            
+            metadata: Attention metadata for paged attention
+
         Returns:
-            Logits tensor of shape [total_tokens, vocab_size], or tuple with debug info
+            Logits tensor of shape [total_tokens, vocab_size]
         """
         # Plan attention computation once for the entire batch (if metadata provided and backend supports planning)
         if metadata is not None and hasattr(self.attention_backend, 'plan'):
@@ -153,7 +144,6 @@ class Qwen3Model(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         
         # Pass through decoder layers following official structure
-        layer_debug_info = None
         for idx, layer in enumerate(self.layers):
             residual = hidden_states
             # Input layer norm
