@@ -40,6 +40,7 @@ logging.basicConfig(level=logging.WARNING)
 DEFAULT_MODEL_MAP = {
     "0.6b": "./models/Qwen3-0.6B",
     "1.7b": "./models/Qwen3-1.7B",
+    "1.7b-awq": "./models/Qwen3-1.7B-AWQ",
 }
 
 

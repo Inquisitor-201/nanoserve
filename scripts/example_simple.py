@@ -29,6 +29,7 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 MODEL_SHORTCUTS = {
     "0.6b": "./models/Qwen3-0.6B",
     "1.7b": "./models/Qwen3-1.7B",
+    "1.7b-awq": "./models/Qwen3-1.7B-AWQ",
 }
 
 
