@@ -4,6 +4,7 @@ Provides high-level API for model loading, configuration, and inference.
 """
 
 import logging
+from pathlib import Path
 from typing import Dict, Any, Optional, List, Union
 import torch
 from transformers import AutoTokenizer
@@ -11,7 +12,7 @@ from transformers import AutoTokenizer
 from .model_executor import ModelExecutor
 from .block_manager import BlockManager
 from .scheduler import Scheduler, Request
-from .config import SamplingConfig, ModelConfig, EngineArgs, CacheConfig, SchedulerConfig
+from .config import SamplingConfig, ModelConfig, CacheConfig, SchedulerConfig
 from .config import auto_calculate_num_blocks
 from .utils import ContinuousBatchTimer
 
@@ -22,38 +23,65 @@ logger = logging.getLogger(__name__)
 class LLMService:
     """
     NanoServe core service class.
-    No longer responsible for "producing" configurations, only for "holding" configurations and driving components.
+
+    Example::
+
+        service = LLMService(model_path="/path/to/qwen3")
+        result = service.generate(["Hello!"], SamplingConfig(temperature=0.6, top_p=0.9, max_new_tokens=512))
     """
-    
+
     def __init__(
         self,
-        model_config: ModelConfig,
-        cache_config: CacheConfig,
-        scheduler_config: SchedulerConfig,
         model_path: str,
+        device: str = "cuda",
+        block_size: int = 16,
+        num_blocks: Optional[int] = None,
+        max_num_seqs: int = 256,
         attention_backend: str = "flashinfer",
     ) -> None:
-        # At this point, Configs are already fully determined "finished products"
+        if not Path(model_path).exists():
+            raise ValueError(f"Model path does not exist: {model_path}")
+
+        # 1. Load model architecture from HF config
+        model_config = ModelConfig.from_hf(model_path)
+
+        # 2. Auto-calculate KV cache block count if not specified
+        if num_blocks is None or num_blocks <= 0:
+            num_blocks = auto_calculate_num_blocks(
+                device=device,
+                dtype=model_config.dtype,
+                block_size=block_size,
+                num_layers=model_config.num_layers,
+                num_kv_heads=model_config.num_key_value_heads,
+                head_dim=model_config.head_dim,
+            )
+
+        # 3. Build derived configs
+        cache_config = CacheConfig(
+            num_blocks=num_blocks,
+            block_size=block_size,
+            device=device,
+        )
+        scheduler_config = SchedulerConfig(max_num_seqs=max_num_seqs)
+
         self.model_config = model_config
         self.cache_config = cache_config
         self.scheduler_config = scheduler_config
         self.model_path = model_path
-        self.device = cache_config.device
-        
-        # 1. Initialize Tokenizer
+        self.device = device
+
+        # 4. Initialize Tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         logger.info(f"EOS token ID: {self.eos_token_id}")
-        
-        # 2. Initialize BlockManager
-        # BlockManager creates and allocates GPU memory pool here
+
+        # 5. Initialize BlockManager (pre-allocates KV cache GPU pool)
         self.block_manager = BlockManager(
             model_config=model_config,
             cache_config=cache_config
         )
-        
-        # 3. Initialize ModelExecutor
-        # Pass the BlockManager's pool to it
+
+        # 6. Initialize ModelExecutor
         self.model_executor = ModelExecutor(
             model_config=model_config,
             cache_config=cache_config,
@@ -61,102 +89,66 @@ class LLMService:
             model_path=model_path,
             attention_backend=attention_backend
         )
-        
-        # 4. Initialize Scheduler
-        # Pass the BlockManager to it for request scheduling
+
+        # 7. Initialize Scheduler
         self.scheduler = Scheduler(scheduler_config, self.block_manager)
-    @classmethod
-    def from_engine_args(cls, engine_args: EngineArgs) -> "LLMService":
-        """
-        Factory method: This is the user's only entry point.
-        Here we complete HF Config reading, parameter merging, and validation.
-        """
-        # 1. Core: Load and parse ModelConfig from HF
-        # This handles all parts that "must be read from huggingface config"
-        model_config = ModelConfig.from_hf(model_path=engine_args.model_path)
-
-        # 2. Core: Determine num_blocks (auto-calculate if not specified)
-        num_blocks = engine_args.num_blocks
-        if num_blocks is None or num_blocks <= 0:
-            num_blocks = auto_calculate_num_blocks(
-                device=engine_args.device,
-                dtype=model_config.dtype,
-                block_size=engine_args.block_size,
-                num_layers=model_config.num_layers,
-                num_kv_heads=model_config.num_key_value_heads,
-                head_dim=model_config.head_dim,
-            )
-
-        # 3. Core: Construct CacheConfig
-        # This handles parts "passed in by the user (such as block_size)"
-        cache_config = CacheConfig(
-            num_blocks=num_blocks,
-            block_size=engine_args.block_size,
-            device=engine_args.device
-        )
-
-        # 3. Core: Construct SchedulerConfig
-        scheduler_config = SchedulerConfig(
-            max_num_seqs=engine_args.max_num_seqs
-        )
-
-        # 4. Final step: Package and pass to __init__
-        return cls(
-            model_config=model_config,
-            cache_config=cache_config,
-            scheduler_config=scheduler_config,
-            model_path=engine_args.model_path,
-            attention_backend=engine_args.attention_backend
-        )
     
     def add_requests(
         self,
-        prompts: Union[str, List[str]],
-        sampling_config: SamplingConfig,
+        prompts: Union[str, List[str], List[List[int]]],
+        sampling_config: Union[SamplingConfig, List[SamplingConfig]],
     ) -> List[str]:
         """
         Add requests to the scheduler.
-        
-        Args:
-            prompts: Input prompt(s)
-            sampling_config: SamplingConfig object
-            
-        Returns:
-            List of request IDs
-        """
-        if self.model_executor is None:
-            raise RuntimeError("No model loaded. Call load_model() first.")
-        
-        if self.tokenizer is None:
-            raise RuntimeError("Tokenizer not loaded. Call load_model() first.")
-        
-        if self.scheduler is None:
-            raise RuntimeError("Scheduler not initialized. Call load_model() first.")
 
+        Args:
+            prompts: Input prompt(s). Strings are tokenized internally;
+                     ``List[List[int]]`` is treated as pre-tokenized.
+            sampling_config: SamplingConfig or list (one per prompt).
+
+        Returns:
+            List of request IDs.
+        """
         if isinstance(prompts, str):
             prompts = [prompts]
-        
-        encoded = self.tokenizer(
-            prompts,
-            padding=True,
-            truncation=True,
-            return_tensors="pt"
-        )
-        input_ids_batch = encoded["input_ids"].to(self.device)
-        attention_mask = encoded["attention_mask"].to(self.device)
-        
-        batch_size = input_ids_batch.size(0)
-        
+
+        is_tokenized = bool(prompts and isinstance(prompts[0], list))
+
+        if isinstance(sampling_config, SamplingConfig):
+            sampling_configs = [sampling_config] * len(prompts)
+        else:
+            sampling_configs = sampling_config
+
         request_ids = []
-        for i in range(batch_size):
-            input_ids = input_ids_batch[i][attention_mask[i].bool()]
-            req_id = self.scheduler.add_request(
-                input_ids=input_ids,
-                sampling_config=sampling_config,
-                eos_token_id=self.eos_token_id
+
+        if is_tokenized:
+            for tokens, sc in zip(prompts, sampling_configs):
+                input_ids = torch.tensor(tokens, device=self.device, dtype=torch.long)
+                req_id = self.scheduler.add_request(
+                    input_ids=input_ids,
+                    sampling_config=sc,
+                    eos_token_id=self.eos_token_id
+                )
+                request_ids.append(req_id)
+        else:
+            encoded = self.tokenizer(
+                prompts,
+                padding=True,
+                truncation=True,
+                return_tensors="pt"
             )
-            request_ids.append(req_id)
-        
+            input_ids_batch = encoded["input_ids"].to(self.device)
+            attention_mask = encoded["attention_mask"].to(self.device)
+
+            for i in range(len(prompts)):
+                input_ids = input_ids_batch[i][attention_mask[i].bool()]
+                req_id = self.scheduler.add_request(
+                    input_ids=input_ids,
+                    sampling_config=sampling_configs[i],
+                    eos_token_id=self.eos_token_id
+                )
+                request_ids.append(req_id)
+
         return request_ids
 
     def main_loop(
@@ -231,29 +223,31 @@ class LLMService:
 
     def generate(
         self,
-        prompts: Union[str, List[str]],
-        sampling_config: SamplingConfig,
+        prompts: Union[str, List[str], List[List[int]]],
+        sampling_config: Union[SamplingConfig, List[SamplingConfig]],
     ) -> List[str]:
         """
         Generate text from prompts using Qwen3 model with scheduling.
-        
+
         Args:
-            prompts: Input prompt(s)
-            sampling_config: SamplingConfig object
-            
+            prompts: Input prompt(s). Strings are tokenized internally;
+                     ``List[List[int]]`` is treated as pre-tokenized.
+            sampling_config: SamplingConfig or list (one per prompt).
+
         Returns:
-            Generated text(s)
+            Generated text(s).
         """
         request_ids = self.add_requests(
             prompts=prompts,
             sampling_config=sampling_config,
         )
-        
+
+        cfg = sampling_config[0] if isinstance(sampling_config, list) else sampling_config
         generated_texts = self.main_loop(
             request_ids=request_ids,
-            sampling_config=sampling_config
+            sampling_config=cfg
         )
-        
+
         return generated_texts
     
     def execute_prefill(

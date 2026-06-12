@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict
 import torch
 
-from core import LLMService, SamplingConfig, EngineArgs
+from core import LLMService, SamplingConfig
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -166,11 +166,10 @@ def main():
     print("  nanoserve  Continuous Batching Testbench")
     print("█" * 70)
 
-    engine_args = EngineArgs(
+    llm_service = LLMService(
         model_path="./models/Qwen3-0.6B",
         device="cuda", block_size=16,
     )
-    llm_service = LLMService.from_engine_args(engine_args)
 
     num_blocks = llm_service.cache_config.num_blocks
     kv_cap = num_blocks * llm_service.cache_config.block_size

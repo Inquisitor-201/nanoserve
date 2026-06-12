@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 from typing import Optional
-from pathlib import Path
 import torch
 import logging
 
@@ -74,12 +73,14 @@ class SamplingConfig:
     temperature: float
     top_p: float
     max_new_tokens: int
+    ignore_eos: bool = False
 
     def to_dict(self) -> dict:
         return {
             "temperature": self.temperature,
             "top_p": self.top_p,
             "max_new_tokens": self.max_new_tokens,
+            "ignore_eos": self.ignore_eos,
         }
 
     @classmethod
@@ -179,7 +180,7 @@ class ModelConfig:
 # Scope:  KV cache pool geometry (num_blocks, block_size) and target device.
 #         BlockManager reads this to pre-allocate the GPU KV cache pool.
 # Owner:  One per LLMService instance. Shared across all requests.
-# Source: EngineArgs (user-provided or auto-calculated). All fields required.
+# Source: LLMService constructor (user-provided or auto-calculated). All fields required.
 # Frozen: yes.
 #
 @dataclass(frozen=True)
@@ -204,7 +205,7 @@ class CacheConfig:
 #
 # Scope:  continuous batching limits (max_num_seqs).
 # Owner:  One per LLMService instance. The Scheduler reads it.
-# Source: EngineArgs (user-provided).
+# Source: LLMService constructor (user-provided).
 # Frozen: yes.
 #
 @dataclass(frozen=True)
@@ -218,65 +219,4 @@ class SchedulerConfig:
 
     @classmethod
     def from_dict(cls, data: dict) -> "SchedulerConfig":
-        return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})
-
-
-# ── EngineArgs: user-facing entry point (single source of defaults) ───────────
-#
-# Scope:  the sole user-facing config struct. Carries enough information to
-#         derive ModelConfig + CacheConfig + SchedulerConfig via
-#         create_engine_configs().
-# Owner:  Transient — consumed by LLMService.from_engine_args(), not stored.
-# Source: user-provided (CLI / API).
-# Frozen: yes.
-#
-# Fields → derived configs:
-#   model_path        → ModelConfig.from_hf(model_path)  (dtype from model)
-#   block_size        → CacheConfig.block_size
-#   num_blocks        → CacheConfig.num_blocks  (None = auto-calculate)
-#   device            → CacheConfig.device
-#   max_num_seqs      → SchedulerConfig.max_num_seqs
-#   attention_backend → ModelExecutor init (not stored in a config)
-#
-@dataclass(frozen=True)
-class EngineArgs:
-    model_path: str
-    device: str = "cuda"
-    block_size: int = 16
-    num_blocks: Optional[int] = None
-    max_num_seqs: int = 256
-    attention_backend: str = "flashinfer"
-
-    def __post_init__(self):
-        if not Path(self.model_path).exists():
-            raise ValueError(f"Model path does not exist: {self.model_path}")
-
-    def create_engine_configs(self):
-        """Derive the three global configs from this EngineArgs."""
-        model_config = ModelConfig.from_hf(self.model_path)
-
-        cache_config = CacheConfig(
-            num_blocks=self.num_blocks,
-            block_size=self.block_size,
-            device=self.device,
-        )
-
-        scheduler_config = SchedulerConfig(
-            max_num_seqs=self.max_num_seqs,
-        )
-
-        return model_config, cache_config, scheduler_config
-
-    def to_dict(self) -> dict:
-        return {
-            "model_path": self.model_path,
-            "device": self.device,
-            "block_size": self.block_size,
-            "num_blocks": self.num_blocks,
-            "max_num_seqs": self.max_num_seqs,
-            "attention_backend": self.attention_backend,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "EngineArgs":
         return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})

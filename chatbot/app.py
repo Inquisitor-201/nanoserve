@@ -11,7 +11,7 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from flask import Flask, request, jsonify, send_from_directory
-from core import LLMService, SamplingConfig, EngineArgs
+from core import LLMService, SamplingConfig
 from transformers import AutoTokenizer
 
 # Setup logging
@@ -25,14 +25,12 @@ import os
 current_dir = os.path.dirname(os.path.abspath(__file__))
 model_path = os.path.join(current_dir, "..", "models", "Qwen3-0.6B")
 
-engine_args = EngineArgs(
+llm_service = LLMService(
     model_path=model_path,
     device="cuda",
     num_blocks=400,
     block_size=16,
 )
-
-llm_service = LLMService.from_engine_args(engine_args)
 logging.info(f"Model loaded successfully on device: {llm_service.device}")
 
 # Initialize tokenizer for Jinja2 template

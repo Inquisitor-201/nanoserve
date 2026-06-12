@@ -3,19 +3,17 @@ import os
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
 
 import logging
-from core import LLMService, SamplingConfig, EngineArgs
+from core import LLMService, SamplingConfig
 
 logging.basicConfig(level=logging.WARNING)
 
 
 def main():
-    engine_args = EngineArgs(
+    llm_service = LLMService(
         model_path="./models/Qwen3-0.6B",
         device="cuda",
         block_size=16,
     )
-
-    llm_service = LLMService.from_engine_args(engine_args)
 
     # Prompts
     prompts = [

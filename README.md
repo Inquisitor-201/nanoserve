@@ -29,21 +29,16 @@ LLMService
 ## Quick Start
 
 ```python
-from core import LLMService, EngineArgs
+from core import LLMService, SamplingConfig
 
-args = EngineArgs(
-    model_path="/path/to/qwen3",
-    max_num_seqs=8,
-    max_model_len=4096,
-)
-service = LLMService.from_engine_args(args)
+service = LLMService(model_path="/path/to/qwen3", max_num_seqs=8)
 
-# Single generation
-output = service.generate("Hello, how are you?")
+# Single generation  
+output = service.generate("Hello, how are you?", SamplingConfig(temperature=0.6, top_p=0.9, max_new_tokens=128))
 print(output)
 
 # Streaming chatbot
-for token in service.generate("Tell me a story", stream=True):
+for token in service.generate("Tell me a story", SamplingConfig(temperature=0.8, top_p=0.9, max_new_tokens=1024)):
     print(token, end="", flush=True)
 ```
 

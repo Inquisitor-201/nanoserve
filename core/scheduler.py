@@ -86,7 +86,7 @@ class Request:
         self.token_ids.append(token)
     
     def is_finished(self) -> bool:
-        if self.token_ids and self.token_ids[-1] == self.eos_token_id:
+        if not self.sampling_config.ignore_eos and self.token_ids and self.token_ids[-1] == self.eos_token_id:
             return True
         # Number of generated tokens equals total tokens minus original prompt length
         generated_tokens_count = len(self.token_ids) - self.prompt_length
