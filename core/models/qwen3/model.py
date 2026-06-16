@@ -120,45 +120,55 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         metadata: Optional[AttentionMetadata] = None,
+        last_token_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass of Qwen3 model following official Transformers structure.
-        
+
         Args:
             input_ids: Input token IDs (flattened: [total_tokens])
             metadata: Attention metadata for paged attention
+            last_token_indices: If set (prefill), only compute lm_head for
+                these hidden-state rows, saving ~vocab_size× the sliced tokens.
 
         Returns:
-            Logits tensor of shape [total_tokens, vocab_size]
+            Logits tensor of shape [total_tokens, vocab_size] when
+            last_token_indices is None, else [num_seqs, vocab_size].
         """
         # Plan attention computation once for the entire batch (if metadata provided and backend supports planning)
         if metadata is not None and hasattr(self.attention_backend, 'plan'):
             self.attention_backend.plan(metadata)
-        
-        # Embedding lookup
-        hidden_states = self.embed_tokens(input_ids)
-        
-        # Pass through decoder layers following official structure
-        for idx, layer in enumerate(self.layers):
-            residual = hidden_states
-            # Input layer norm
-            hidden_states = layer.input_layernorm(hidden_states)
 
-            hidden_states = layer.self_attn(hidden_states, metadata)
+        with torch.inference_mode():
+            # Embedding lookup
+            hidden_states = self.embed_tokens(input_ids)
 
-            # Add residual connection after attention
-            hidden_states = residual + hidden_states
+            # Pass through decoder layers following official structure
+            for idx, layer in enumerate(self.layers):
+                residual = hidden_states
+                # Input layer norm
+                hidden_states = layer.input_layernorm(hidden_states)
 
-            # Post-attention layer norm and MLP with residual connection
-            residual = hidden_states
-            hidden_states = layer.post_attention_layernorm(hidden_states)
-            hidden_states = layer.mlp(hidden_states)
-            hidden_states = residual + hidden_states
-        
-        # Final layer norm
-        hidden_states = self.norm(hidden_states)
-        
-        # LM head projection
-        logits = self.lm_head(hidden_states)
+                hidden_states = layer.self_attn(hidden_states, metadata)
+
+                # Add residual connection after attention
+                hidden_states = residual + hidden_states
+
+                # Post-attention layer norm and MLP with residual connection
+                residual = hidden_states
+                hidden_states = layer.post_attention_layernorm(hidden_states)
+                hidden_states = layer.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+
+            # Final layer norm
+            hidden_states = self.norm(hidden_states)
+
+            # Prefill optimisation: only compute lm_head for the last token of
+            # each sequence — the rest are discarded anyway after the slice.
+            if last_token_indices is not None:
+                hidden_states = hidden_states[last_token_indices]
+
+            # LM head projection
+            logits = self.lm_head(hidden_states)
 
         return logits

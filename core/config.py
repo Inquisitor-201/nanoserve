@@ -22,6 +22,7 @@ def auto_calculate_num_blocks(
     safety_factor: float = 0.65,
     min_blocks: int = 64,
     max_blocks: int = 10000,
+    max_num_seqs: int = 128,
 ) -> int:
     """
     Automatically calculate the optimal number of KV cache blocks
@@ -38,6 +39,8 @@ def auto_calculate_num_blocks(
         safety_factor: Fraction of remaining GPU memory available for KV cache
         min_blocks: Minimum allowed blocks
         max_blocks: Maximum allowed blocks
+        max_num_seqs: Maximum concurrent sequences (caps blocks to leave
+            room for intermediate activations during prefill).
 
     Returns:
         Calculated number of blocks
@@ -69,6 +72,20 @@ def auto_calculate_num_blocks(
 
     available_for_kv = int((total_memory - estimated_model_memory) * safety_factor)
     blocks = available_for_kv // bytes_per_block
+
+    # Hard cap: leave at least 35 % of total GPU memory for intermediate
+    # activations during prefill (hidden states, attention scores, logits).
+    # Without this, a large prefill batch can OOM even though the KV cache
+    # would have been fine.
+    max_safe = int(total_memory * (1.0 - safety_factor) * 0.55) // bytes_per_block
+    if blocks > max_safe:
+        logger.info(
+            "Capping KV blocks from %d to %d (leaving ~%d MiB for activations)",
+            blocks, max_safe,
+            int(total_memory * (1.0 - safety_factor) * 0.55 / 1024 / 1024),
+        )
+        blocks = max_safe
+
     blocks = max(min_blocks, min(blocks, max_blocks))
 
     total_gib = total_memory / (1024 ** 3)
@@ -269,10 +286,12 @@ class CacheConfig:
 @dataclass(frozen=True)
 class SchedulerConfig:
     max_num_seqs: int
+    max_num_batched_tokens: int = 8192
 
     def to_dict(self) -> dict:
         return {
             "max_num_seqs": self.max_num_seqs,
+            "max_num_batched_tokens": self.max_num_batched_tokens,
         }
 
     @classmethod

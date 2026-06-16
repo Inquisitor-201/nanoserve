@@ -1,0 +1,47 @@
+=== nanoserve Benchmark (Qwen3-0.6B) ===
+
+Model:   Qwen3-0.6B (hidden_size=2048, 24 layers, vocab_size=151936)
+GPU:     12 GiB (11.76 GiB usable)
+Dtype:   bfloat16
+Backend: FlashInfer (paged KV cache, block_size=16)
+
+Sampling: temperature=0.6, top_p=1.0, ignore_eos=True
+
+--- Bench.py scale (256 seqs, 100-1024 tok) ---
+
+Default:                    OOM (prefill batch 142K tokens)
++ max_num_seqs=64:          OOM (KV cache too large, intermediate activations)
++ chunked prefill:          OOM on 12 GiB (KV pool still 768+ blocks)
++ chunked prefill + 512 bl: 173 tok/s (frequent preemption, KV cache starved)
+
+--- Smaller scale (50-200 io tokens, w/ chunk_size=8192) ---
+
+ seqs | total_tok | time (s) | throughput (tok/s)
+------+-----------+----------+-------------------
+   8  |    323    |   2.70   |     119.67
+  16  |   2149    |   9.66   |     222.43
+  32  |   4058    |   8.98   |     452.12
+  64  |   8297    |  17.37   |     477.69
+ 128  |  15760    |  27.44   |     574.40
+ 256  |  32395    |  56.67   |     571.60
+
+--- Chunked prefill verification (1.7B, meaningful text) ---
+
+chunk_size=1:  ✓ output correct ("<think>\n嗯，用户问的是"中国是一个")
+chunk_size=8:  ✓ output correct (longer prompt chunked 27→8+8+8+3)
+
+--- Key changes in feat-chunked-prefill ---
+
+1. SchedulerConfig: added chunk_size (default 8192)
+2. _schedule_prefill: only processes chunk_size tokens per request per step
+3. _schedule_continue_prefill: new phase for remaining prompt chunks
+4. AttentionMetadata: position_offsets for correct positional encoding in chunks
+5. model.forward: last_token_indices=None for partial chunks (skip lm_head)
+6. main_loop: handles is_partial flag (no sampling for partial chunks)
+
+--- Limitation ---
+
+12 GiB GPU can't fit 64 seqs × 1024 tokens even with chunked prefill.
+512 KV blocks = only 8192 total token slots → frequent preemption.
+vLLM overcomes this via CUDA graphs (reduces memory fragmentation) and
+more efficient memory allocator.

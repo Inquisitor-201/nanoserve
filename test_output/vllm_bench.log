@@ -1,0 +1,32 @@
+=== vLLM Benchmark (Qwen3-0.6B) ===
+
+Command: python scripts/bench.py --backend vllm
+
+Date: 2026-06-13
+Model: Qwen3-0.6B
+Backend: vLLM 0.8.5
+GPU: CUDA 12.4, Driver 550.163.01
+Torch: 2.6.0+cu124
+
+Hardware:
+  GPU Memory: 24 GB
+  Model size: ~1.12 GiB
+
+Parameters:
+  num_seqs = 256
+  min_input_len = 100
+  max_input_len = 1024
+  min_output_len = 100
+  max_output_len = 1024
+  (random token IDs, random output lengths)
+
+Timing Breakdown:
+  Model loading:            0.57s
+  torch.compile:           60.44s  (first-run, cached on subsequent runs)
+  Graph capture/warmup:    29.00s
+  Inference (256 seqs):    91.55s
+
+Results:
+  Total output tokens:     133,966
+  Time:                    91.55 s
+  Throughput:              1,463.27 tok/s

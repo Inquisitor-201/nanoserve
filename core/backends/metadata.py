@@ -86,7 +86,8 @@ class AttentionMetadata:
         page_size: int,
         is_prefill: bool = True,
         causal: bool = True,
-        device: Union[str, torch.device] = "cuda"
+        device: Union[str, torch.device] = "cuda",
+        position_offsets: Optional[List[int]] = None,
     ) -> "AttentionMetadata":
         """
         Create metadata from block tables and sequence lengths.
@@ -98,24 +99,34 @@ class AttentionMetadata:
             causal: Whether to use causal mask
             device: Device for tensor creation
             page_size: Page size for block management
+            position_offsets: Global position offset for each sequence
+                (used for chunked prefill where the chunk doesn't start at 0).
 
         Returns:
             AttentionMetadata instance
         """
         seq_lens_tensor = torch.tensor(seq_lengths, dtype=torch.int32, device=device)
-        num_pages = (seq_lens_tensor + page_size - 1) // page_size
+        if position_offsets is None:
+            position_offsets = [0] * len(seq_lengths)
 
+        # Page table: include ALL allocated pages, not just those for this chunk
+        num_pages_total = [
+            (offs + seq_len + page_size - 1) // page_size
+            for offs, seq_len in zip(position_offsets, seq_lengths)
+        ]
         flat_indices = []
         indptr = [0]
-        for block_table, num_pg in zip(block_tables, num_pages.tolist()):
+        for block_table, num_pg in zip(block_tables, num_pages_total):
             flat_indices.extend(block_table[:num_pg])
             indptr.append(len(flat_indices))
 
-        last_page_len = ((seq_lens_tensor - 1) % page_size + 1).to(dtype=torch.int32)
-
         paged_kv_indices = torch.tensor(flat_indices, dtype=torch.int32, device=device)
         paged_kv_indptr = torch.tensor(indptr, dtype=torch.int32, device=device)
-        paged_kv_last_page_len = last_page_len
+
+        # last_page_len: total pages (global sequence length), not just chunk
+        global_seq_lens = [offs + seq_len for offs, seq_len in zip(position_offsets, seq_lengths)]
+        global_lens_tensor = torch.tensor(global_seq_lens, dtype=torch.int32, device=device)
+        paged_kv_last_page_len = ((global_lens_tensor - 1) % page_size + 1).to(dtype=torch.int32)
 
         batch_size = len(seq_lengths)
 
@@ -131,15 +142,20 @@ class AttentionMetadata:
             )
 
             total_tokens = int(seq_lens_tensor.sum())
+            # Positions within each sequence (0, 1, 2, ..., chunk_len-1)
             positions = torch.arange(total_tokens, dtype=torch.int32, device=device)
             q_offsets = torch.repeat_interleave(
                 qo_indptr_tensor[:-1],
                 seq_lens_tensor
             )
-            # Ensure q_offsets is int32 to match positions
             q_offsets = q_offsets.to(dtype=torch.int32)
             positions = positions - q_offsets
-            # Ensure positions remains int32
+            # Add global offset for chunked prefill
+            offsets_tensor = torch.tensor(
+                position_offsets, dtype=torch.int32, device=device
+            )
+            global_offsets = torch.repeat_interleave(offsets_tensor, seq_lens_tensor)
+            positions = positions + global_offsets
             positions = positions.to(dtype=torch.int32)
         else:
             qo_indptr_tensor = None

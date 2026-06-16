@@ -109,32 +109,34 @@ class ModelExecutor:
         input_ids: torch.Tensor,
         block_tables: List[List[int]],
         seq_lengths: List[int],
-        is_prefill: bool
+        is_prefill: bool,
+        last_token_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Execute prefill phase.
-        
+        Execute prefill / decode phase.
+
         Args:
             input_ids: Input token IDs
-            block_tables: Block tables for each sequence (must be non-empty)
+            block_tables: Block tables for each sequence
             seq_lengths: Sequence lengths
-            
+            last_token_indices: When set (prefill), only lm-head these rows.
+
         Returns:
-            Hidden states after prefill
+            Logits tensor.
         """
-        # Create attention metadata for prefill
+        # Create attention metadata
         metadata = AttentionMetadata.from_block_tables(
             block_tables=block_tables,
             seq_lengths=seq_lengths,
             is_prefill=is_prefill,
             page_size=self.block_size,
-            device=self.device
+            device=self.device,
         )
-        
+
         # Execute model forward pass with profiling
         with ProfileTimer(self.stats, is_prefill):
-            logits = self.model(input_ids, metadata)
-        
+            logits = self.model(input_ids, metadata, last_token_indices)
+
         return logits
 
     def generate(

@@ -168,12 +168,14 @@ class Scheduler:
 
     def schedule(self) -> SchedulerOutput:
         # --- Phase 1: PREFILL (Priority) ---
-        # Prefill round handles new requests or large chunks. 
-        # For simplicity, we only prefill when waiting_list is not empty.
+        # If prefill can't schedule anything (blocks exhausted), fall
+        # through to decode rather than returning empty.
         if self.waiting_list:
-            return self._schedule_prefill()
+            out = self._schedule_prefill()
+            if out.scheduled_requests:
+                return out
 
-        # --- Phase 2: DECODE with One-shot Preemption ---
+        # --- Phase 2: DECODE ---
         if self.running_list:
             return self._schedule_decode()
 

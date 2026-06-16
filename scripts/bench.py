@@ -8,9 +8,19 @@ Usage:
 """
 
 import os
+import sys
+
+# Enable PyTorch memory allocator to expand segments on demand
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
+                      "expandable_segments:True,max_split_size_mb:512")
+
+# Ensure project root is on sys.path so `from core import ...` works
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import time
 from random import randint, seed
-import sys
 import torch
 
 
@@ -39,6 +49,10 @@ def main():
     output_lens = [randint(min_output_len, max_output_len) for _ in range(num_seqs)]
 
     # ── Init model ─────────────────────────────────────────────────────
+    if backend == "nanoserve":
+        import logging, warnings
+        warnings.filterwarnings("ignore", message=".*torch_dtype.*")
+        logging.getLogger("core").setLevel(logging.WARNING)
     if backend == "vllm":
         from vllm import LLM, SamplingParams
         llm = LLM(model_path, max_num_seqs=num_seqs, max_model_len=4096)
@@ -60,21 +74,18 @@ def main():
         ]
         gen_kwargs = {}
 
-    # ── Warmup ─────────────────────────────────────────────────────────
-    print("Warming up ...")
+    # ── Warmup (vLLM only — nanoserve warmup causes allocator frag) ────
     if backend == "vllm":
+        print("Warming up ...")
         llm.generate(
             [dict(prompt_token_ids=[randint(0, 10000) for _ in range(64)])],
             SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=32),
             use_tqdm=False,
         )
-    else:
-        llm.generate(
-            [[randint(0, 10000) for _ in range(64)]],
-            SamplingConfig(temperature=0.6, top_p=1.0, ignore_eos=True, max_new_tokens=32),
-        )
 
     # ── Benchmark ──────────────────────────────────────────────────────
+    import gc
+    gc.collect()
     torch.cuda.synchronize()
     t = time.time()
     llm.generate(prompts, sampling_params, **gen_kwargs)

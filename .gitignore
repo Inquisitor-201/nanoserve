@@ -21,5 +21,7 @@ __pycache__/
 build/
 *.egg-info
 
+vllm_src
+
 # Project instructions (not for distribution)
 CLAUDE.md

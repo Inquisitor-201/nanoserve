@@ -36,8 +36,10 @@ class LLMService:
         device: str = "cuda",
         block_size: int = 16,
         num_blocks: Optional[int] = None,
-        max_num_seqs: int = 256,
+        max_num_seqs: int = 64,
+        max_num_batched_tokens: int = 8192,
         attention_backend: str = "flashinfer",
+        gpu_memory_utilization: float = 0.90,
     ) -> None:
         if not Path(model_path).exists():
             raise ValueError(f"Model path does not exist: {model_path}")
@@ -45,54 +47,227 @@ class LLMService:
         # 1. Load model architecture from HF config
         model_config = ModelConfig.from_hf(model_path)
 
-        # 2. Auto-calculate KV cache block count if not specified
-        if num_blocks is None or num_blocks <= 0:
-            num_blocks = auto_calculate_num_blocks(
-                device=device,
-                dtype=model_config.dtype,
-                block_size=block_size,
-                num_layers=model_config.num_layers,
-                num_kv_heads=model_config.num_key_value_heads,
-                head_dim=model_config.head_dim,
-                model_config=model_config,
-            )
-
-        # 3. Build derived configs
-        cache_config = CacheConfig(
-            num_blocks=num_blocks,
-            block_size=block_size,
-            device=device,
+        # 2. Build derived configs (KV cache size determined below)
+        scheduler_config = SchedulerConfig(
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
         )
-        scheduler_config = SchedulerConfig(max_num_seqs=max_num_seqs)
 
         self.model_config = model_config
-        self.cache_config = cache_config
         self.scheduler_config = scheduler_config
         self.model_path = model_path
         self.device = device
 
-        # 4. Initialize Tokenizer
+        # 3. Initialize Tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         logger.info(f"EOS token ID: {self.eos_token_id}")
 
-        # 5. Initialize BlockManager (pre-allocates KV cache GPU pool)
-        self.block_manager = BlockManager(
-            model_config=model_config,
-            cache_config=cache_config
-        )
+        # 4. Determine KV cache size
+        if num_blocks is not None and num_blocks > 0:
+            # User-specified — skip profiling
+            cache_config = CacheConfig(
+                num_blocks=num_blocks, block_size=block_size, device=device)
+            block_manager = BlockManager(model_config, cache_config)
+            model_executor = self._create_executor(
+                model_config, cache_config, block_manager, model_path, attention_backend)
+        else:
+            # Profile-driven: create model with a tiny KV cache, measure peak
+            # memory during a dummy forward, then size the real KV cache.
+            model_executor, block_manager = self._init_with_profiling(
+                model_config=model_config,
+                block_size=block_size,
+                model_path=model_path,
+                attention_backend=attention_backend,
+                gpu_memory_utilization=gpu_memory_utilization,
+            )
 
-        # 6. Initialize ModelExecutor
-        self.model_executor = ModelExecutor(
+        # 5. Initialize Scheduler
+        self.block_manager = block_manager
+        self.model_executor = model_executor
+        self.scheduler = Scheduler(scheduler_config, block_manager)
+
+    # ── Profile helpers ────────────────────────────────────────────────
+
+    def _create_executor(self, model_config, cache_config, block_manager,
+                         model_path, attention_backend):
+        """Create ModelExecutor with the given KV cache pool."""
+        return ModelExecutor(
             model_config=model_config,
             cache_config=cache_config,
-            kv_cache_pool=self.block_manager.kv_cache_pool,
+            kv_cache_pool=block_manager.kv_cache_pool,
             model_path=model_path,
-            attention_backend=attention_backend
+            attention_backend=attention_backend,
         )
 
-        # 7. Initialize Scheduler
-        self.scheduler = Scheduler(scheduler_config, self.block_manager)
+    def _profile_memory(
+        self, model, block_manager, max_num_batched_tokens, max_num_seqs, device
+    ) -> int:
+        """Run a dummy forward pass and return the peak allocated bytes.
+
+        Uses a batch of ``max_num_batched_tokens`` tokens distributed across
+        ``max_num_seqs`` sequences — matching the exact distribution that the
+        real prefill step will use.  This is critical because FlashInfer's
+        paged attention workspace varies with the *number of sequences*, not
+        just the total token count.
+        """
+        from .backends import AttentionMetadata
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        # Build a batch matching the actual distribution that the
+        # KV-cache-aware scheduler will produce (~14-18 seqs on this GPU).
+        # Profile with at most 16 sequences to get a representative
+        # FlashInfer workspace size (the workspace grows with batch size).
+        budget = min(max_num_batched_tokens, 8192)
+        num_seqs = min(max_num_seqs, budget // 16, 16)  # cap at 16
+        tokens_per_seq = budget // num_seqs
+        tail = budget % num_seqs
+        seq_lengths = [tokens_per_seq + (1 if i < tail else 0)
+                       for i in range(num_seqs)]
+        total_tokens = sum(seq_lengths)  # exact budget
+
+        input_ids = torch.randint(0, 100, (total_tokens,), device=device)
+
+        # Allocate blocks for each dummy sequence
+        block_tables = []
+        for seq_len in seq_lengths:
+            blocks = block_manager.allocate_blocks([], seq_len)
+            if not blocks:
+                raise RuntimeError(
+                    f"Not enough KV blocks for profiling "
+                    f"(need {sum(seq_lengths)} tokens, "
+                    f"have {block_manager.num_blocks} blocks)")
+            block_tables.append(blocks)
+
+        metadata = AttentionMetadata.from_block_tables(
+            block_tables=block_tables,
+            seq_lengths=seq_lengths,
+            page_size=block_manager.block_size,
+            is_prefill=True,
+            device=device,
+        )
+
+        # Last-token indices (matches the behaviour of our lm_head
+        # optimisation during real prefill).
+        last_token_indices = torch.cumsum(
+            torch.tensor(seq_lengths, device=device), dim=0
+        ) - 1
+
+        with torch.no_grad():
+            out = model(input_ids, metadata, last_token_indices)
+        # Keep the output alive to ensure its memory is counted in the peak
+        out = out.clone()
+        del out
+
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        logger.info(
+            "Profile run: %d seqs × %d tok = %d total, peak=%.2f GiB",
+            num_seqs, tokens_per_seq, total_tokens, peak / 1024**3,
+        )
+
+        # Free allocated blocks
+        for bt in block_tables:
+            block_manager.free_blocks(bt)
+
+        return peak
+
+    def _init_with_profiling(
+        self, model_config, block_size, model_path,
+        attention_backend, gpu_memory_utilization,
+    ):
+        """Create model, profile peak memory, and size KV cache accordingly.
+
+        Steps:
+          1. Create model with a *tiny* KV cache pool (128 blocks).
+          2. Load weights onto GPU.
+          3. Run one dummy forward pass (4 seqs × 256 tokens).
+          4. Read ``allocated_bytes.all.peak``.
+          5. Calculate: available_kv = total × gpu_mem_util − peak.
+          6. Allocate real KV cache with the calculated size.
+          7. Swap the real pool into the already-loaded model.
+        """
+        device = self.device
+        budget = self.scheduler_config.max_num_batched_tokens
+        profile_tokens = min(budget, 8192)
+        profile_seq_count = min(self.scheduler_config.max_num_seqs,
+                                profile_tokens // 16, 16)
+        tokens_per_seq, tail = divmod(profile_tokens, profile_seq_count)
+        profile_blocks_needed = sum(
+            (tokens_per_seq + (1 if i < tail else 0) + block_size - 1) // block_size
+            for i in range(profile_seq_count)
+        )
+        PROFILE_BLOCKS = max(128, profile_blocks_needed + 32)
+
+        bytes_per_block = (
+            model_config.num_layers
+            * 2                              # K + V
+            * block_size
+            * model_config.num_key_value_heads
+            * model_config.head_dim
+            * torch.tensor([], dtype=model_config.dtype).element_size()
+        )
+
+        # ── Phase 1: create model with minimal KV cache for profiling ──
+        profile_cache = CacheConfig(
+            num_blocks=PROFILE_BLOCKS, block_size=block_size, device=device)
+        profile_bm = BlockManager(model_config, profile_cache)
+        model_executor = self._create_executor(
+            model_config, profile_cache, profile_bm,
+            model_path, attention_backend)
+        model = model_executor.model
+
+        profile_pool_bytes = PROFILE_BLOCKS * bytes_per_block
+
+        # ── Phase 2: profile ──
+        peak = self._profile_memory(
+            model, profile_bm, budget,
+            self.scheduler_config.max_num_seqs, device)
+
+        # ── Phase 3: tear down profile pool ──
+        total_gpu = torch.cuda.get_device_properties(0).total_memory
+        # The model AND the executor hold references to the profile KV pool.
+        # Replace both so the profile pool can be reclaimed.
+        model.attention_backend.kv_cache_pool = torch.empty(0, device=device)
+        model_executor.kv_cache_pool = torch.empty(0, device=device)
+        del profile_bm
+        torch.cuda.empty_cache()
+
+        # ── Phase 4: calculate real KV cache size ──
+        # After cleanup the surviving allocations are:
+        #   model weights + FlashInfer workspaces + PyTorch allocator overhead.
+        # We subtract those from total × util then round down by one
+        # intermediate-activation peak to guarantee forward pass fits.
+        surviving = torch.cuda.memory_allocated()
+        intermediate_peak = peak - surviving
+        available_kv = total_gpu * gpu_memory_utilization - surviving - intermediate_peak
+        # Reserve 1.25 GiB for allocator fragmentation/headroom (PyTorch's
+        # caching allocator can fragment free memory, leaving no single
+        # contiguous chunk large enough for intermediate tensors).
+        available_kv -= 1280 * 1024 * 1024
+        num_blocks = max(64, int(available_kv // bytes_per_block))
+
+        # ── Phase 5: allocate real KV cache ──
+        real_cache = CacheConfig(
+            num_blocks=num_blocks, block_size=block_size, device=device)
+        real_bm = BlockManager(model_config, real_cache)
+
+        # Swap the real pool into the existing model backend
+        model.attention_backend.kv_cache_pool = real_bm.kv_cache_pool
+
+        model_gib = sum(
+            p.numel() * p.element_size() for p in model.parameters()
+        ) / 1024**3
+        logger.info(
+            "Memory profile:  model=%.2f GiB  "
+            "peak=%.2f GiB  util=%.2f  "
+            "kv_available=%.2f GiB → %d blocks",
+            model_gib, peak / 1024**3, gpu_memory_utilization,
+            available_kv / 1024**3, num_blocks,
+        )
+
+        return model_executor, real_bm
 
     def add_requests(
         self,
@@ -178,11 +353,9 @@ class LLMService:
                 sched_output, sampling_config
             )
 
-            # 3. Update scheduler with results
-            # Wrap tokens in tensors to match your optimized scheduler's expected input
+            # Update scheduler with new tokens
             new_tokens = [t.view(1) for t in sampled_tokens]
             active_ids = [req.request_id for req in sched_output.scheduled_requests]
-
             self.scheduler.update_running_requests(new_tokens, active_ids)
             step += 1
 
@@ -201,23 +374,25 @@ class LLMService:
         return self._collect_results(request_ids)
 
     def _run_inference_step(self, sched_output, sampling_config: SamplingConfig):
-        """Unified inference step handling both Prefill and Decode."""
+        """Unified inference step handling Prefill and Decode."""
         is_prefill = sched_output.is_prefill
-        
-        # Use ContinuousBatchTimer for profiling
+
+        # Prefill optimisation: only compute lm_head for the last token of
+        # each sequence to save ~vocab_size × (tokens - seqs) FLOPs.
+        last_token_indices = None
+        if is_prefill:
+            last_token_indices = torch.cumsum(
+                torch.tensor(sched_output.seq_lengths, device=self.device), dim=0
+            ) - 1
+
         with ContinuousBatchTimer(sched_output.scheduled_requests):
             logits = self.model_executor.execute_batch(
                 input_ids=sched_output.input_ids,
                 block_tables=sched_output.block_tables,
                 seq_lengths=sched_output.seq_lengths,
-                is_prefill=is_prefill
+                is_prefill=is_prefill,
+                last_token_indices=last_token_indices,
             )
-
-        if is_prefill:
-            indices = torch.cumsum(
-                torch.tensor(sched_output.seq_lengths, device=self.device), dim=0
-            ) - 1
-            logits = logits[indices]
 
         return self.model_executor.sample(
             logits,
