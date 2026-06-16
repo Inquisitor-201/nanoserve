@@ -4,13 +4,15 @@
 |---|---|---|
 | vLLM 0.8.5 | 1476 | `enforce_eager=False` (default): CUDA graphs + torch.compile |
 | vLLM 0.8.5 | 1200 | `enforce_eager=True`: 跳过 compile 和 graph capture |
-| nanoserve | 1178 | `enforce_eager=True` (default): 无 compile, 无 graph |
+| nanoserve | 1178 | `enforce_eager=True` (default): 无 compile |
+| nanoserve | ❌ | `enforce_eager=False`: torch.compile 与 FlashInfer 不兼容 |
 
 ## 结论
 
 - nanoserve 与 vLLM 在同等条件下（均无 compile）性能**对齐到 2% 以内**
-- vLLM 的 CUDA graphs + torch.compile 带来约 **20% 加速**，代价是首次加载耗时 ~40s
+- vLLM 的 CUDA graphs + torch.compile 带来约 **20%** 加速，代价是首次加载耗时 ~40s，显存 +0.46 GiB
 - nanoserve 启动耗时 **~2.5s**
+- **nanoserve 无法使用 torch.compile**——FlashInfer 的自定义 CUDA kernel 对 torch.compile 不透明，编译后的 Triton kernel 访问 FlashInfer 内部 tensor 时崩溃
 
 ## 影响吞吐的核心因素
 

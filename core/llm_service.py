@@ -40,6 +40,7 @@ class LLMService:
         max_num_batched_tokens: int = 8192,
         attention_backend: str = "flashinfer",
         gpu_memory_utilization: float = 0.90,
+        enforce_eager: bool = True,
     ) -> None:
         if not Path(model_path).exists():
             raise ValueError(f"Model path does not exist: {model_path}")
@@ -86,6 +87,10 @@ class LLMService:
         self.block_manager = block_manager
         self.model_executor = model_executor
         self.scheduler = Scheduler(scheduler_config, block_manager)
+
+        # 6. Optionally torch.compile the model (skip with enforce_eager=True)
+        if not enforce_eager:
+            logger.warning("enforce_eager=False requires torch.compile + FlashInfer compatibility")
 
     # ── Profile helpers ────────────────────────────────────────────────
 
