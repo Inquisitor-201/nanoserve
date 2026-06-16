@@ -88,9 +88,12 @@ class LLMService:
         self.model_executor = model_executor
         self.scheduler = Scheduler(scheduler_config, block_manager)
 
-        # 6. Optionally torch.compile the model (skip with enforce_eager=True)
+        # 6. Partial compilation disabled — torch.compile on MLP
+        #    submodules regressed throughput (1070 vs 1178 tok/s) for this
+        #    small model.  Keep the API for future experiments.
         if not enforce_eager:
-            logger.warning("enforce_eager=False requires torch.compile + FlashInfer compatibility")
+            logger.info("enforce_eager=False: torch.compile skipped "
+                        "(no benefit for Qwen3-0.6B MLP-only compile)")
 
     # ── Profile helpers ────────────────────────────────────────────────
 
