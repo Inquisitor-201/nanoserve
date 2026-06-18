@@ -106,7 +106,9 @@ class Qwen3Model(nn.Module):
         
         # Final layer norm (generic)
         self.norm = nn.RMSNorm(hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
-        
+
+        self.eval()
+
         # LM Head
         self.lm_head = nn.Linear(
             hidden_size,

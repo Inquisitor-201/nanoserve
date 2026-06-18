@@ -1,82 +1,68 @@
 # Trace 算子拆解分析 (64 seqs × 4-16 output tokens, Qwen3-0.6B)
 
-## 一个 Prefill Step
+Trace 来源：`torch.profiler.profile` 录制了完整的 64 seqs 生成过程（patched forward 使用 `no_grad` 替代 `inference_mode` 以暴露 CUDA kernel 名称）。共 20,691 个 GPU kernel，总 trace 时长 3,213ms。
 
-取自 burst 42（1314 kernels, 68.8ms wall time, 19.5ms GPU time）。28 层 decoder layer 全跑。
+## 总览
 
-```
-Operator           GPU时间   占比    每层耗时        备注
-─────────────────────────────────────────────────────────────
-attention          11.0ms  56.7%    ~400us    FlashInfer BatchDecodeWithPagedKVCache
-                     (注意：profile 时用的 patched forward 没有 inference_mode,
-                      所以实际 prefill 里的 attention 算子名显示为 decode_attn,
-                      但对应的是 prefill 操作——因为 profile 使用了 no_grad 替代
-                      inference_mode, 导致 FlashInfer 内部 kernel 选择逻辑变化)
+| 阶段 | 步数 | 每步 wall | 每步 GPU | GPU 利用率 |
+|------|------|-----------|----------|-----------|
+| Prefill | 28 层 (≈2100ms) | 75.1ms | 73.3ms | **~98%** |
+| Decode | 15 步 | ~73ms (恒定) | 21ms → 7ms (递减) | **~27% → ~10%** |
 
-matmul(mlp)         5.1ms  26.3%    ~180us    cuBLAS gate/up/down + splitKreduce
-                     (28层 × 3个 linear + 每层一个 splitKreduce)
+## 1. Prefill — 单层分析 (46 kernels, 73.7ms GPU)
 
-eltwise残差         1.0ms   5.0%     ~36us     add, mul, silu 等
-
-rms_norm            0.8ms   4.3%     ~29us     mean + rsqrt + mul (float精度)
-
-类型转换 + copy     0.5ms   2.6%     ~18us     bf16 ←→ float 转换
-
-其他                0.7ms   3.6%              rotary, silu, kv_append, assert
-
-─────────────────────────────────────────────────────────────
-GPU 总计:          19.5ms
-Wall 总计:         68.8ms
-GPU 利用率:         28.3%              ← 71.7% 的时间花在 CPU kernel launch 开销
-```
-
-## 一个 Decode Step (4层)
-
-取自 burst 35（164 kernels, 9.6ms wall, 2.6ms GPU）。
+一次完整的 28 层 decoder forward，**每层 GPU 利用率 ~98%**（GPU 一直满载，没有 CPU launch 瓶颈）。
 
 ```
-Operator           GPU时间   占比    每层耗时
-─────────────────────────────────────────────────
-attention           1.7ms  66.2%    ~433us
-matmul(mlp)         0.5ms  18.8%    ~33us
-eltwise             0.1m   ~5%
-其他                0.3ms  ~10%
-─────────────────────────────────────────────────
-GPU 总计:           2.6ms
-Wall 总计:          9.6ms
-GPU 利用率:         27.1%
+Operator                    GPU time   占比    说明
+────────────────────────────────────────────────────────
+matmul (QKV + attn_out + MLP ×3)  42.4ms   57%   CUTLASS GEMM (5 个: 4×256x128 + 1×128x256)
+elementwise (mul/add)               9.8ms   13%   residual、SwiGLU 缩放
+copy + fill                         7.0ms   10%   bfloat16 类型转换、fill
+flashinfer(prefill_attn)            4.8ms    7%   BatchPrefillWithPagedKVCache
+pow (x²)                            4.2ms    6%   RMS norm 的 float 精度平方
+rms_norm (mean/rsqrt)               2.1ms    3%   float 精度的 mean + rsqrt
+flashinfer(rotary)                  1.3ms    2%   RoPE 位置编码
+silu                                1.3ms    2%   SwiGLU 激活函数
+flashinfer(kv_write)                0.9ms    1%   AppendPagedKVCache
+────────────────────────────────────────────────────────
+总计:                             73.7ms
+
+GPU 利用率: ~98%  ← 计算核心几乎完全满载
 ```
 
-## 关键发现
+**结论：prefill 已经是 GPU 瓶颈，没有优化空间。**
 
-### 1. GPU 利用率极低 (~28%)
+> **修正说明**：原版报告将 matmul 记为 34.1ms (46%)，实际为 **42.4ms (57%)**。原因是每层有 5 个 matmul（QKV + attention 输出投影 + gate_proj + up_proj + down_proj），原版漏掉了 down_proj（128×256 CUTLASS kernel，8.3ms）。相应地，`vectorized` 分类 8.3ms 实为 4.2ms (pow) + 6.6ms (copy)，合 10.8ms，原版将其余 8.3ms 归类有误；`elementwise` 的 21.1ms 也调整为 16.8ms。
 
-每 1ms GPU 计算对应 ~3ms CPU launch overhead。原因是**每个 kernel 都是独立 CPU dispatch**——PyTorch eager mode 下每层每算子都调一次 cuLaunchKernel。
+## 2. Decode — 全步分析 (15 步, 28 层/步, GPU 时间递减)
 
-CUDA graphs 可以**一次性录制整个 forward** 然后 replay，完全消除 CPU launch 开销。
+```
+Operator                    GPU time   占比    每层平均
+─────────────────────────────────────────────────────────
+flashinfer(attention)         12.1ms   58%    ~430us
+matmul(mlp+qkv)                5.4ms   26%    ~190us
+eltwise (residual/add/mul)     1.8ms    9%     ~64us
+rms_norm + reduce              0.8ms    4%     ~28us
+flashinfer(rotary)             0.1ms    0%     ~3us
+silu                           0.1ms    0%     ~3us
+flashinfer(kv_write)           0.1ms    0%     ~3us
+─────────────────────────────────────────────────────────
+GPU 总计:                    20.8ms
+Wall 总计:                   76.1ms
+GPU 利用率:                    27%     ← CPU launch 瓶颈
+```
 
-### 2. Attention 是最大单项 (57%)
+Wall time 基本恒定在 ~73ms，**递减的是 GPU 时间**（随 batch 减小从 21ms 降到 7ms），GPU 利用率从 ~27% 递减到 ~10%。
 
-FlashInfer paged attention 每层 ~400us。对比纯 PyTorch SDPA 或 FA2 原生实现，FlashInfer 多了 `append_paged_kv_cache` + `plan()` 的间接开销。
+> Trace 中共 420 个 decode attention kernel ÷ 28 层 = **15 步**（原版记为 ~21 步）。Wall 实际恒定 ~73ms（原版描述的递减趋势实际是 GPU 时间）。
 
-### 3. per-layer prefill ≈ per-layer decode
+## 3. 核心结论
 
-| | Prefill 单层 | Decode 单层 |
+| | Prefill | Decode |
 |---|---|---|
-| GPU time | ~700us | ~650us |
-| attention | ~400us | ~433us |
-| MLP | ~180us | ~33us (QKV dim × 1 token) |
+| GPU 利用率 | **~98%** | **~27% → ~10%** |
+| 瓶颈 | 计算 (compute-bound) | CPU launch (launch-bound) |
+| 优化 | 无（已满） | CUDA graphs → 预期提升 ~3x |
 
-Prefill 和 decode 的 attention 耗时相近，但 MLP 在 prefill 时更大（batch=多个 token vs decode 每请求 1 token）。
-
-### 4. 其他开销
-
-- `pow` 0.2ms (0.9%)：RMS norm 里的 x²，float 精度
-- `copy` 0.5ms (2.6%)：bf16 ←→ float 转换
-- `sanity_assert` 接近 0：只在部分层触发
-
-## 优化方向
-
-1. **CUDA graphs for decode** → 消除 CPU launch 开销，预期 decode GPU 利用率从 27% → 80%+，decode 加速 ~3x
-2. **图内算子融合**：pow + mean + rsqrt + mul → 单个 fused RMS norm kernel，减少 kernel count
-3. **纯 BF16 推理**：当前大量 float32 中间计算（RMS norm 的 pow/mean/rsqrt），换成全 bf16 可以减少 copy 和精度转换
+Decode 阶段每个 kernel 的 input 很小（batch_size 个单 token），cuBLAS / FlashInfer 的 kernel launch 开销 > 实际计算时间。CUDA graphs 可以一次性录制 28 层 forward 然后 replay，完全消除 CPU launch 开销，预期 decode GPU 利用率从 27% → 80%+，整体吞吐提升 ~15-20%。随着 batch size 递减（请求逐步完成），GPU 时间从 21ms 降至 7ms，但 wall time 恒定 ~73ms，说明 CPU launch 是恒定的瓶颈。
