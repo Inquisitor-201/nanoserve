@@ -24,4 +24,4 @@ build/
 vllm_src
 
 # Project instructions (not for distribution)
-CLAUDE.md
+CLAUDE.md*.json
