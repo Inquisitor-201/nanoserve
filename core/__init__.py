@@ -3,6 +3,10 @@ Core package for the model architecture.
 Contains models, layers, backends, and utilities for efficient inference.
 """
 
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True,max_split_size_mb:512")
+
 from .backends import AttentionMetadata, FlashInferBackend
 from .layers_utils import RMSNorm, Embedding, Linear
 from .models import Qwen3Model

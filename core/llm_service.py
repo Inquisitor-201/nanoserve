@@ -40,7 +40,7 @@ class LLMService:
         max_num_batched_tokens: int = 8192,
         attention_backend: str = "flashinfer",
         gpu_memory_utilization: float = 0.90,
-        enforce_eager: bool = True,
+        enforce_eager: bool = False,
     ) -> None:
         if not Path(model_path).exists():
             raise ValueError(f"Model path does not exist: {model_path}")
@@ -88,12 +88,14 @@ class LLMService:
         self.model_executor = model_executor
         self.scheduler = Scheduler(scheduler_config, block_manager)
 
-        # 6. Partial compilation disabled — torch.compile on MLP
-        #    submodules regressed throughput (1070 vs 1178 tok/s) for this
-        #    small model.  Keep the API for future experiments.
+        # 6. CUDA graph capture for decode attention acceleration
         if not enforce_eager:
-            logger.info("enforce_eager=False: torch.compile skipped "
-                        "(no benefit for Qwen3-0.6B MLP-only compile)")
+            backend = self.model_executor.model.attention_backend
+            backend.use_cuda_graph = True
+            backend.capture_decode_graphs(max_batch_size=max_num_seqs)
+
+        if enforce_eager:
+            logger.info("CUDA graphs disabled (enforce_eager=True)")
 
     # ── Profile helpers ────────────────────────────────────────────────
 

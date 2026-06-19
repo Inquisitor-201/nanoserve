@@ -115,6 +115,9 @@ class ModelExecutor:
         """
         Execute prefill / decode phase.
 
+        For decode with CUDA graphs, creates zero-copy metadata using
+        pre-allocated CG buffers (``create_cg_decode_metadata``).
+
         Args:
             input_ids: Input token IDs
             block_tables: Block tables for each sequence
@@ -124,16 +127,24 @@ class ModelExecutor:
         Returns:
             Logits tensor.
         """
-        # Create attention metadata
-        metadata = AttentionMetadata.from_block_tables(
-            block_tables=block_tables,
-            seq_lengths=seq_lengths,
-            is_prefill=is_prefill,
-            page_size=self.block_size,
-            device=self.device,
-        )
+        backend = self.model.attention_backend
+        use_cg = (not is_prefill and backend.use_cuda_graph
+                  and bool(backend._cg_resources))
 
-        # Execute model forward pass with profiling
+        if use_cg:
+            # Zero-copy: fill CG buffers in-place, metadata references them.
+            metadata = backend.create_cg_decode_metadata(
+                block_tables, seq_lengths, self.block_size)
+        else:
+            # Standard metadata construction (D→H→D copy for page tables).
+            metadata = AttentionMetadata.from_block_tables(
+                block_tables=block_tables,
+                seq_lengths=seq_lengths,
+                is_prefill=is_prefill,
+                page_size=self.block_size,
+                device=self.device,
+            )
+
         with ProfileTimer(self.stats, is_prefill):
             logits = self.model(input_ids, metadata, last_token_indices)
 

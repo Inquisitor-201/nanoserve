@@ -3,16 +3,14 @@
 Offline throughput benchmark — side-by-side nanoserve vs vLLM.
 
 Usage:
-    python scripts/bench.py                        # nanoserve
-    python scripts/bench.py --backend vllm         # vLLM
+    python scripts/bench.py                           # nanoserve (CUDA graph)
+    python scripts/bench.py --eager                   # nanoserve (no CUDA graph)
+    python scripts/bench.py --backend vllm            # vLLM
+    python scripts/bench.py --profile                 # nanoserve + trace
 """
 
 import os
 import sys
-
-# Enable PyTorch memory allocator to expand segments on demand
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
-                      "expandable_segments:True,max_split_size_mb:512")
 
 # Ensure project root is on sys.path so `from core import ...` works
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -26,10 +24,16 @@ import torch
 
 def main():
     backend = "nanoserve"
+    eager = False
+    profile = False
     if "--backend" in sys.argv:
         idx = sys.argv.index("--backend")
         if idx + 1 < len(sys.argv):
             backend = sys.argv[idx + 1]
+    if "--eager" in sys.argv:
+        eager = True
+    if "--profile" in sys.argv:
+        profile = True
 
     seed(0)
 
@@ -65,7 +69,8 @@ def main():
         gen_kwargs = dict(use_tqdm=False)
     else:
         from core import LLMService, SamplingConfig
-        llm = LLMService(model_path=model_path, max_num_seqs=num_seqs)
+        llm = LLMService(model_path=model_path, max_num_seqs=num_seqs,
+                         enforce_eager=eager)
         prompts = prompt_token_ids
         sampling_params = [
             SamplingConfig(temperature=0.6, top_p=1.0, ignore_eos=True,
@@ -88,13 +93,34 @@ def main():
     gc.collect()
     torch.cuda.synchronize()
     t = time.time()
-    llm.generate(prompts, sampling_params, **gen_kwargs)
+    if profile:
+        from torch.profiler import profile, ProfilerActivity
+        trace_path = f"test_output/trace_{'eager' if eager else 'cudagraph'}.json"
+        with profile(
+            activities=[
+                ProfilerActivity.CPU,
+                ProfilerActivity.CUDA,
+            ],
+            record_shapes=False,
+            with_stack=False,
+            with_flops=False,
+        ) as prof:
+            llm.generate(prompts, sampling_params, **gen_kwargs)
+        torch.cuda.synchronize()
+        prof.export_chrome_trace(trace_path)
+        print(f"Trace exported to {trace_path}")
+    else:
+        llm.generate(prompts, sampling_params, **gen_kwargs)
     torch.cuda.synchronize()
     t = time.time() - t
 
     total_tokens = sum(output_lens)
     throughput = total_tokens / t
-    print(f"[{backend}] num_seqs={num_seqs}, total_output_tokens={total_tokens}, "
+    tag = f"[{backend}"
+    if backend == "nanoserve":
+        tag += "-EAGER" if eager else "-CG"
+    tag += "]"
+    print(f"{tag} num_seqs={num_seqs}, total_output_tokens={total_tokens}, "
           f"time={t:.2f}s, throughput={throughput:.2f} tok/s")
     return 0
 
