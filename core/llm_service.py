@@ -90,9 +90,8 @@ class LLMService:
 
         # 6. CUDA graph capture for decode attention acceleration
         if not enforce_eager:
-            backend = self.model_executor.model.attention_backend
-            backend.use_cuda_graph = True
-            backend.capture_decode_graphs(max_batch_size=max_num_seqs)
+            self.model_executor.capture_decode_graphs(
+                max_batch_size=max_num_seqs)
 
         if enforce_eager:
             logger.info("CUDA graphs disabled (enforce_eager=True)")
