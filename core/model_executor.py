@@ -57,6 +57,7 @@ class _CGBatchResources:
         "logits",
         "metadata",
         "graph",
+        "cg_wrapper",
     )
 
     def __init__(self, batch_size: int, vocab_size: int, dtype: torch.dtype,
@@ -95,6 +96,7 @@ class _CGBatchResources:
             positions=self.positions,             # full [batch_size]
         )
         self.graph = None
+        self.cg_wrapper = None
 
     def update_page_table(self, block_tables, seq_lengths, page_size):
         """CPU build → single bulk copy_() per buffer."""
@@ -237,8 +239,9 @@ class ModelExecutor:
                 bs, vocab_size, self.dtype, self.device)
             self._cg_resources[bs] = res
 
-            # Init the backend's CG wrapper (fixed indptr/indices buffers)
-            backend.init_cg_wrapper(
+            # Init the backend's CG wrapper (fixed indptr/indices buffers).
+            # Store in res.cg_wrapper to keep the workspace alive during replay.
+            res.cg_wrapper = backend.init_cg_wrapper(
                 bs, res.indptr, res.indices, res.last_page_len)
 
             # Fill dummy page table (1 page/seq → block 0)
@@ -322,12 +325,17 @@ class ModelExecutor:
     ) -> torch.Tensor:
         """Run one decode step via pre-captured full-forward graph.
 
-        1. Memcpy new input values into fixed CG buffers
-        2. ``graph.replay()`` (all layers: norms + attention + MLP + lm_head)
-        3. Return logits slice (first ``batch_size`` rows)
+        1. Activate this batch's CG wrapper (keep workspace alive)
+        2. Memcpy new input values into fixed CG buffers
+        3. ``graph.replay()`` (all layers: norms + attention + MLP + lm_head)
+        4. Return logits slice (first ``batch_size`` rows)
         """
         batch_size = len(seq_lengths)
         res = self._get_cg_resources(batch_size)
+
+        # Activate this batch's CG wrapper so the captured graph's CUDA
+        # operations reference the correct, still-alive workspace.
+        self.model.attention_backend._cg_wrapper = res.cg_wrapper
 
         # Update fixed buffers (CPU → GPU bulk copy)
         res.input_ids[:batch_size].copy_(input_ids)
