@@ -96,7 +96,7 @@ def _execute_cg_decode(self, input_ids, block_tables, seq_lengths):
     # 更新输入缓冲区
     res.input_ids[:batch_size].copy_(input_ids)
     res.positions[:batch_size].copy_(positions)
-    res.update_page_table(block_tables, seq_lengths, ...)
+    res.upload_block_tables(block_tables, seq_lengths, ...)
 
     # 一次 cuGraphLaunch = 全部 28 层 + lm_head
     res.graph.replay()
@@ -139,6 +139,62 @@ for bs in reversed(batch_sizes):
 
 ---
 
+### Bug 2: `_plan_decode` 跳过 CG wrapper plan → page-table drift → 输出退化
+
+**现象**：CG 模式输出质量严重退化（"thinkazazazaazaz" 类型重复），而 eager 模式正常。在长生成（>100 tokens）中尤为明显，表现为"奔跑到某个 token 后突然分叉退化为重复"。
+
+**影响版本**：ccbfac5 ~ 修复前。
+
+**根因**：
+
+```python
+# 修复前：flashinfer_backend.py
+def _plan_decode(self, metadata):
+    if self._cg_wrapper is not None:
+        return  # ← ✗ 直接跳过！workspace 不更新
+```
+
+`CUDAGraphBatchDecodeWithPagedKVCacheWrapper.plan()` 会将 page table 数据预计算为 attention kernel 的元数据（如每序列需要读哪些 KV page、chunk 偏移等）写入固定地址的 workspace buffer。graph capture 时，kernel 读取的是这个 workspace 的固定地址。
+
+但 `_plan_decode` 在 CG 路径下直接 return，意味着 **plan() 只在 `init_cg_wrapper()`（capture 前）被调用过一次**，用的是 dummy page table（每序列 1 页 → block 0）。
+
+真实推理过程中，序列不断增长、acquire 新 block，page table 从 `[0]` 演进到 `[0, 17, 42, ...]`。但 workspace 里的预计算元数据还是基于 `[0]` 的旧数据 → attention 读到的 KV 位置越来越偏移正确值 → logits 逐渐偏离 → 某一步 argmax 翻转 → cascade 退化。
+
+**为什么不是第一步就错，而是跑到某个 token 才分叉**：
+- 前几步序列还在 1 页内，page table = `[0]`，和 dummy 一致 → workspace 正确 → token 一致
+- 首次需要第 2 页时：workspace 里没有这个新页的信息 → attention 读到错误 KV 位置 → logits 微小偏移但 argmax 可能还没变
+- 累积偏移 → argmax 翻转 → 第一个错误 token → cascade
+
+**修复**：
+
+```python
+# 修复后：flashinfer_backend.py
+def _plan_decode(self, metadata):
+    if self._cg_wrapper is not None:
+        # 用当前（已更新）的 page table 重算 workspace 元数据
+        self._cg_wrapper.plan(
+            metadata.paged_kv_indptr,
+            metadata.paged_kv_indices,
+            metadata.paged_kv_last_page_len,
+            self.num_heads, self.num_key_value_heads, self.head_dim,
+            self.page_size,
+            q_data_type=self.dtype, kv_data_type=self.dtype,
+            pos_encoding_mode="NONE",
+        )
+        return
+```
+
+**关键理解**：
+- `plan()` 不在 CUDA Graph 内部（capture 只 capture `model.forward()`），它在 replay 前作为 CPU 操作（或 `cudaMemcpyAsync`）更新 workspace buffer 数据。capture 时 kernel 读的是 workspace 的**地址**，不是数据——所以每次 replay 前更新数据是安全的，也是必要的。
+- **顺序要求**：`plan()` 必须在 `upload_block_tables()` **之后**调用。因为 `plan()` 会从 indptr/indices 缓冲区**读取数据**来预计算 workspace 元数据。如果先 plan 再更新 page table，workspace 将基于老旧数据计算，replay 时 kernel 读到的 buffer 数据和 workspace 元数据不一致，可能导致 attention 读到错误偏移甚至 GPU hang。
+
+**验证**：
+- 0.6B ABC 测试：CG PASS, Eager PASS, 两者一致
+- 1.7B 多序列泛化：CG 和 eager 输出一致，质量正常
+- 跨实例重复运行：CG 与 eager 输出 token-by-token 一致
+
+---
+
 ## 性能
 
 RTX 3060 (12GB) + Qwen3-0.6B, 256 req, output ~524 tokens/req:
@@ -155,20 +211,24 @@ CG 加速比：**2.1×**。提速来自：
 
 ---
 
-## TODO
+## 性能对比总表
 
-### [Perf] Eager 模式吞吐回归
+RTX 3060 (12GB) + Qwen3-0.6B, 256 req, output ~524 tokens/req:
 
-**现状**：当前 HEAD 的 `--eager` 吞吐仅 662 tok/s，但 commit `f31df09`（引入 CG 前的基线）有 1177 tok/s。回归约 **44%**。
+| 版本 | Time | Throughput | vs nanoserve eager | vs nanoserve CG |
+|------|------|------------|-------------------|-----------------|
+| vLLM V1 (torch.compile + CUDA Graph + FlashAttn) | 140.18s | 955.65 tok/s | 1.44× | 0.69× |
+| **nanoserve CG** | **97.04s** | **1380.59 tok/s** | **2.09×** | **1.0×** |
+| nanoserve eager | 202.27s | 662.32 tok/s | 1.0× | 0.48× |
+| `f31df09` 基线 (eager) | 208.60s | 642.22 tok/s | 0.97× | 0.47× |
 
-**待排查方向**：
+结论：
 
-| 可能原因 | 说明 |
-|---|---|
-| FlashInfer `_plan_decode` 每次都被调用 | `run()` 中 `metadata is not self._current_metadata` 总是 True（新 metadata 是每次创建的临时对象），导致每一步都重新 plan |
-| `model.eval()` 副作用 | ccbfac5 在 `Qwen3Model.__init__` 末尾加了 `self.eval()`，虽不应影响推理性能，但需确认 |
-| `core/__init__.py` 的 `PYTORCH_CUDA_ALLOC_CONF` | 新增 `expandable_segments:True,max_split_size_mb:512`，从 bench.py 移到 __init__.py 后执行时机不同 |
-| ProfileTimer 的 `synchronize` 被移除 | ProfileTimer 现在完全注释掉（`__enter__/__exit__` 都是 pass），但回归前是有 synchronize 的——不应变慢 |
-| 需要 bisect | 用 `git bisect` 在 `f31df09..HEAD` 范围内定位精确回归 commit |
+- **nanoserve CG 比 vLLM V1（已开 torch.compile + CUDA Graph）快 44%**
+- nanoserve CG 比 nanoserve eager 快 2.09×
+- `f31df09` commit message 中的 "1177 tok/s" 系不同条件测得，同一 bench.py 实际跑得 642 tok/s。无 eager 回归。
 
-**目标**：恢复 eager 到 1177 tok/s 水平，同时保持 CG 性能。
+vLLM 使用了 Flash Attention 后端 + torch.compile(PIECEWISE) + piecewise CUDA Graph，
+nanoserve 使用 FlashInfer 后端 + full-forward CUDA Graph（无 torch.compile）。
+差距主要来自 nanoserve 的 full-forward CG 策略（单次 cuGraphLaunch vs vLLM 的逐层 replay），
+以及 FlashInfer 的 decode kernel 在 RTX 3060 上比 Flash Attention 更高效。
