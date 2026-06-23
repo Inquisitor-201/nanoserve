@@ -25,3 +25,6 @@ vllm_src
 
 # Project instructions (not for distribution)
 CLAUDE.md*.json
+
+# Generated benchmark/profiling output
+test_output/

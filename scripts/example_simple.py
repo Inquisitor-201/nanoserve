@@ -60,6 +60,7 @@ def main():
         model_path=model_path,
         device="cuda",
         block_size=16,
+        enforce_eager=False
     )
     print(f"  Model loaded in {time.time()-t0:.1f}s\n")
 
