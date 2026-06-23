@@ -51,7 +51,7 @@ class BlockManager:
         self.head_dim = model_config.head_dim
         self.dtype = model_config.dtype
 
-        self.kv_cache_pool = torch.empty(
+        self.kv_cache_pool = torch.zeros(
             (self.num_layers, self.num_blocks, 2, self.block_size, self.num_kv_heads, self.head_dim),
             dtype=self.dtype,
             device=self.device

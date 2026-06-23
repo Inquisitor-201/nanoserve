@@ -98,8 +98,8 @@ class _CGBatchResources:
         self.graph = None
         self.cg_wrapper = None
 
-    def update_page_table(self, block_tables, seq_lengths, page_size):
-        """CPU build → single bulk copy_() per buffer."""
+    def upload_block_tables(self, block_tables, seq_lengths, page_size):
+        """Convert scheduler block_tables → GPU indptr/indices/last_page_len buffers."""
         bs = len(seq_lengths)
         cg_bs = self.batch_size
         cpu_indices = []
@@ -250,10 +250,13 @@ class ModelExecutor:
             res.indices[:bs].zero_()
             res.last_page_len[:bs].fill_(1)
 
-            # Warmup: run forward once eagerly to trigger lazy allocations
-            with torch.inference_mode():
-                _ = self.model(res.input_ids[:bs], res.metadata)
-            torch.cuda.synchronize()
+            # Warmup: run forward multiple times to trigger lazy allocations
+            # (cuBLAS workspaces, attention kernel allocations, etc.) before
+            # capture — otherwise those cudaMallocs get baked into the graph.
+            for _ in range(3):
+                with torch.inference_mode():
+                    _ = self.model(res.input_ids[:bs], res.metadata)
+                torch.cuda.synchronize()
 
             # Capture the entire forward into one graph.
             # Write directly into res.logits[:bs] so replay writes
@@ -271,6 +274,13 @@ class ModelExecutor:
 
         self._cg_batch_sizes = sorted(self._cg_resources.keys())
         self._use_cg = True
+
+        # Clear KV cache after capture: warmup/capture wrote garbage into
+        # block 0 via the dummy page table (all sequences → block 0).
+        kv_pool = self.model.attention_backend.kv_cache_pool
+        kv_pool.zero_()
+        torch.cuda.synchronize()
+
         logger.info(
             "Full-forward CUDA decode graphs ready: batch_sizes=%s",
             ", ".join(str(b) for b in self._cg_batch_sizes))
@@ -305,7 +315,11 @@ class ModelExecutor:
                         input_ids, block_tables, seq_lengths)
                 return logits
 
-        # Eager path (prefill or no CG)
+        # Eager path (prefill or no CG).
+        # Clear CG wrapper so backend.run() uses the correct page table
+        # from the new metadata, not the stale CG fixed buffers.
+        self.model.attention_backend._cg_wrapper = None
+
         metadata = AttentionMetadata.from_block_tables(
             block_tables=block_tables,
             seq_lengths=seq_lengths,
@@ -313,6 +327,8 @@ class ModelExecutor:
             page_size=self.block_size,
             device=self.device,
         )
+        # Plan attention once for the batch (before forward, not inside CUDA graph)
+        self.model.attention_backend.plan(metadata)
         with ProfileTimer(self.stats, is_prefill):
             logits = self.model(input_ids, metadata, last_token_indices)
         return logits
@@ -326,9 +342,10 @@ class ModelExecutor:
         """Run one decode step via pre-captured full-forward graph.
 
         1. Activate this batch's CG wrapper (keep workspace alive)
-        2. Memcpy new input values into fixed CG buffers
-        3. ``graph.replay()`` (all layers: norms + attention + MLP + lm_head)
-        4. Return logits slice (first ``batch_size`` rows)
+        2. Memcpy new input values + page table into fixed CG buffers
+        3. ``plan()`` — recompute attention workspace from updated page table
+        4. ``graph.replay()`` (all layers: norms + attention + MLP + lm_head)
+        5. Return logits slice (first ``batch_size`` rows)
         """
         batch_size = len(seq_lengths)
         res = self._get_cg_resources(batch_size)
@@ -343,7 +360,12 @@ class ModelExecutor:
             [sl - 1 for sl in seq_lengths], dtype=torch.int32,
             device=self.device)
         res.positions[:batch_size].copy_(positions_t)
-        res.update_page_table(block_tables, seq_lengths, self.block_size)
+        res.upload_block_tables(block_tables, seq_lengths, self.block_size)
+
+        # Plan: recompute attention workspace metadata from the updated
+        # page-table buffers.  Must be *after* upload_block_tables() so
+        # cg_wrapper.plan() reads the correct indptr/indices data.
+        self.model.attention_backend.plan(res.metadata)
 
         # Replay — all layers in one cuGraphLaunch
         res.graph.replay()

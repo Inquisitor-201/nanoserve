@@ -161,7 +161,19 @@ class FlashInferBackend:
 
     def _plan_decode(self, metadata: AttentionMetadata) -> None:
         if self._cg_wrapper is not None:
-            return  # CG path: buffers pre-planned, no-op here
+            # Call plan() on the CG wrapper to precompute workspace metadata
+            # from the (updated) page-table buffers.  plan() writes to a
+            # fixed-address workspace that the captured graph reads from.
+            self._cg_wrapper.plan(
+                metadata.paged_kv_indptr,
+                metadata.paged_kv_indices,
+                metadata.paged_kv_last_page_len,
+                self.num_heads, self.num_key_value_heads, self.head_dim,
+                self.page_size,
+                q_data_type=self.dtype, kv_data_type=self.dtype,
+                pos_encoding_mode="NONE",
+            )
+            return
         self.decode_wrapper.plan(
             metadata.paged_kv_indptr,
             metadata.paged_kv_indices,

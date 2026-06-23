@@ -137,9 +137,7 @@ class Qwen3Model(nn.Module):
             Logits tensor of shape [total_tokens, vocab_size] when
             last_token_indices is None, else [num_seqs, vocab_size].
         """
-        # Plan attention computation once for the entire batch (if metadata provided and backend supports planning)
-        if metadata is not None and hasattr(self.attention_backend, 'plan'):
-            self.attention_backend.plan(metadata)
+        # (plan() is called by execute_batch before forward — not here)
 
         with torch.inference_mode():
             # Embedding lookup
