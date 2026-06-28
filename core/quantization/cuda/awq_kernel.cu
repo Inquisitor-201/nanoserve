@@ -25,14 +25,13 @@ __global__ void awq_linear_kernel(
     const int b = idx / out_features;
     const int j = idx % out_features;
     constexpr int pf = 8;
+    const int col_idx = j / pf;
+    const int nib     = REORDER[j % pf];
+    const int shift   = nib * 4;
 
     float acc = 0.0f;
 
     for (int i = 0; i < in_features; ++i) {
-        const int col_idx = j / pf;
-        const int nib     = REORDER[j % pf];
-        const int shift   = nib * 4;
-
         const int w_packed = qweight[i * (out_features / pf) + col_idx];
         const int w_val    = (w_packed >> shift) & 0xF;
 
