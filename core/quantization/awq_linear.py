@@ -51,7 +51,7 @@ class AWQLinear(nn.Module):
     # ── forward (fused CUDA kernel) ──────────────────────────────────
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from .cuda.awq_kernel import awq_linear_forward
+        from .cuda.awq_kernel_naive import awq_linear_forward
         return awq_linear_forward(
             x, self.qweight, self.qzeros,
             self.scales.to(torch.bfloat16),    # scales loaded as fp16
