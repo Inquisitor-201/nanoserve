@@ -141,12 +141,15 @@ python scripts/download_model.py 0.6b
 hf download Qwen/Qwen3-0.6B --local-dir ./models/Qwen3-0.6B
 ```
 
+**快速开始：**
+```bash
+python scripts/example_simple.py
+```
+
 **运行基准测试：**
 ```bash
-python scripts/testbench.py              # 连续批处理测试（burst vs staggered）
 python scripts/bench.py                  # 吞吐量基准（支持 --backend vllm 对比）
-python scripts/bench.py --eager           # 禁用 CUDA Graph 对比
-python scripts/profile_trace.py           # torch.profiler Chrome trace
+python scripts/bench.py --eager          # 禁用 CUDA Graph 对比
 ```
 
 ---

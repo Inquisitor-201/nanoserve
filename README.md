@@ -142,12 +142,15 @@ python scripts/download_model.py 0.6b
 hf download Qwen/Qwen3-0.6B --local-dir ./models/Qwen3-0.6B
 ```
 
+**Quick start:**
+```bash
+python scripts/example_simple.py
+```
+
 **Run benchmarks:**
 ```bash
-python scripts/testbench.py              # continuous batching (burst vs staggered)
 python scripts/bench.py                  # throughput benchmark (supports --backend vllm)
 python scripts/bench.py --eager          # disable CUDA Graph for comparison
-python scripts/profile_trace.py          # torch.profiler Chrome trace export
 ```
 
 ---
