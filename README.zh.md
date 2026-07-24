@@ -1,6 +1,6 @@
 <p align="right"><a href="README.md">English</a> | <strong>中文</strong></p>
 
-# nanoserve
+<h1 align="center">NanoServe 🚀</h1>
 
 <div align="center">
 
